@@ -35,6 +35,10 @@ import type { PromptItem, PromptTransition } from "../lib/api";
 import { getInputSourceResolution } from "../lib/api";
 import { sendLoRAScaleUpdates } from "../utils/loraHelpers";
 import { toast } from "sonner";
+import { WorkflowExportDialog } from "../components/WorkflowExportDialog";
+import { exportWorkflow } from "../lib/workflowApi";
+import { settingsToWorkflowParams } from "../lib/workflowSettings";
+import type { WorkflowTimelineEntry } from "../lib/workflowApi";
 
 // Delay before resetting video reinitialization flag (ms)
 // This allows useVideoSource to detect the flag change and trigger reinitialization
@@ -184,6 +188,10 @@ export function StreamPage() {
 
   // Recording toggle state
   const [isRecording, setIsRecording] = useState(false);
+
+  // Workflow export dialog state
+  const [showWorkflowExportDialog, setShowWorkflowExportDialog] =
+    useState(false);
 
   // Track when waiting for cloud WebSocket to connect after clicking Play
   const [isCloudConnecting, setIsCloudConnecting] = useState(false);
@@ -1390,6 +1398,71 @@ export function StreamPage() {
     }
   };
 
+  const handleSaveWorkflowExport = useCallback(
+    async (name: string, description: string) => {
+      try {
+        // Build frontend_params from current settings
+        const pipelineParams = settingsToWorkflowParams(
+          settings,
+          getPipelineDefaultMode
+        );
+        // frontend_params is keyed by pipeline_id
+        const frontendParams: Record<string, Record<string, unknown>> = {
+          [settings.pipelineId]: pipelineParams,
+        };
+
+        // Build timeline from current prompts
+        const timelineEntries: WorkflowTimelineEntry[] = timelinePrompts
+          .filter(p => p.startTime !== p.endTime)
+          .map(p => ({
+            start_time: p.startTime,
+            end_time: p.endTime,
+            prompts: p.prompts || [{ text: p.text, weight: 100 }],
+            transition_steps: p.transitionSteps,
+            temporal_interpolation_method: p.temporalInterpolationMethod,
+          }));
+
+        // Include the active prompt in pipeline params (not as a timeline entry)
+        if (promptItems.length > 0 && promptItems.some(p => p.text.trim())) {
+          pipelineParams.prompts = promptItems.map(p => ({
+            text: p.text,
+            weight: p.weight,
+          }));
+        }
+
+        const workflow = await exportWorkflow({
+          name,
+          description,
+          frontend_params: frontendParams,
+          timeline:
+            timelineEntries.length > 0
+              ? { entries: timelineEntries }
+              : undefined,
+        });
+
+        // Download as file
+        const dataStr = JSON.stringify(workflow, null, 2);
+        const blob = new Blob([dataStr], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        const safeName = name.replace(/[^a-zA-Z0-9-_]/g, "-").toLowerCase();
+        link.download = `${safeName}.scope-workflow.json`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        toast.success("Workflow exported");
+      } catch (err) {
+        toast.error("Failed to export workflow", {
+          description: err instanceof Error ? err.message : "Unknown error",
+        });
+      }
+    },
+    [settings, timelinePrompts]
+  );
+
   const handleSaveGeneration = async () => {
     try {
       if (!sessionId) {
@@ -1668,6 +1741,7 @@ export function StreamPage() {
               onSaveGeneration={handleSaveGeneration}
               isRecording={isRecording}
               onRecordingToggle={() => setIsRecording(prev => !prev)}
+              onSaveWorkflow={() => setShowWorkflowExportDialog(true)}
             />
           </div>
         </div>
@@ -1789,6 +1863,11 @@ export function StreamPage() {
           }}
         />
       )}
+      <WorkflowExportDialog
+        open={showWorkflowExportDialog}
+        onClose={() => setShowWorkflowExportDialog(false)}
+        onExport={handleSaveWorkflowExport}
+      />
     </div>
   );
 }

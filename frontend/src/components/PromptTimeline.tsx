@@ -23,11 +23,16 @@ import {
   Maximize2,
   Minimize2,
 } from "lucide-react";
-import { ExportDialog } from "./ExportDialog";
+import { WorkflowImportDialog } from "./WorkflowImportDialog";
 
 import type { PromptItem } from "../lib/api";
 import type { SettingsState } from "../types";
+import { workflowParamsToSettings } from "../lib/workflowSettings";
 import { generateRandomColor } from "../utils/promptColors";
+import { useLoRAsContext } from "../contexts/LoRAsContext";
+import type { ScopeWorkflow, WorkflowResolutionPlan } from "../lib/workflowApi";
+import { validateWorkflow } from "../lib/workflowApi";
+import { toast } from "sonner";
 
 // Timeline constants
 const BASE_PIXELS_PER_SECOND = 20;
@@ -169,6 +174,7 @@ interface PromptTimelineProps {
   onSaveGeneration?: () => void;
   isRecording?: boolean;
   onRecordingToggle?: () => void;
+  onSaveWorkflow?: () => void;
 }
 
 export function PromptTimeline({
@@ -198,9 +204,10 @@ export function PromptTimeline({
   videoScaleMode = "fit",
   onVideoScaleModeToggle,
   isDownloading = false,
-  onSaveGeneration,
+  onSaveGeneration: _onSaveGeneration,
   isRecording = false,
   onRecordingToggle,
+  onSaveWorkflow,
 }: PromptTimelineProps) {
   const timelineRef = useRef<HTMLDivElement>(null);
   const [timelineWidth, setTimelineWidth] = useState(800);
@@ -209,6 +216,8 @@ export function PromptTimeline({
     DEFAULT_VISIBLE_END_TIME
   );
   const [zoomLevel, setZoomLevel] = useState(1);
+
+  const { loraFiles } = useLoRAsContext();
 
   // Check if live mode is active
   const isLive = useMemo(() => prompts.some(p => p.isLive), [prompts]);
@@ -409,9 +418,87 @@ export function PromptTimeline({
     [selectedPromptId, onPromptSelect, onPromptEdit]
   );
 
-  const [showExportDialog, setShowExportDialog] = useState(false);
+  const [pendingWorkflow, setPendingWorkflow] = useState<ScopeWorkflow | null>(
+    null
+  );
+  const [resolutionPlan, setResolutionPlan] =
+    useState<WorkflowResolutionPlan | null>(null);
+  const [showWorkflowImportDialog, setShowWorkflowImportDialog] =
+    useState(false);
+  const [isApplying, setIsApplying] = useState(false);
 
-  const handleSaveTimeline = useCallback(() => {
+  const handleApplyWorkflow = useCallback(
+    async (_installMissingPlugins: boolean) => {
+      if (!pendingWorkflow) return;
+      setIsApplying(true);
+      try {
+        // Apply settings to UI directly — don't load the pipeline on the backend.
+        // The user starts the pipeline when they're ready.
+        if (onSettingsImport && pendingWorkflow.pipelines.length > 0) {
+          const wp = pendingWorkflow.pipelines[0];
+          const mapped = workflowParamsToSettings(
+            wp.pipeline_id,
+            wp.params,
+            wp.loras,
+            loraFiles
+          );
+
+          onSettingsImport(mapped);
+        }
+
+        // Import timeline entries
+        if (pendingWorkflow.timeline?.entries) {
+          resetTimelineUI();
+          const importedPrompts: TimelinePrompt[] =
+            pendingWorkflow.timeline.entries.map((entry, index) => ({
+              id: `workflow-${Date.now()}-${index}`,
+              text: entry.prompts.map(p => p.text).join(", "),
+              startTime: entry.start_time,
+              endTime: entry.end_time,
+              prompts: entry.prompts,
+              color: generateRandomColor(),
+              isLive: false,
+              transitionSteps: entry.transition_steps,
+              temporalInterpolationMethod: entry.temporal_interpolation_method,
+            }));
+          onPromptsChange(importedPrompts);
+        }
+
+        // Restore the active prompt if stored in params
+        if (pendingWorkflow.pipelines.length > 0) {
+          const prompts = pendingWorkflow.pipelines[0].params.prompts as
+            | Array<{ text: string; weight: number }>
+            | undefined;
+          if (prompts && prompts.length > 0 && _onPromptSubmit) {
+            _onPromptSubmit(prompts.map(p => p.text).join(", "));
+          }
+        }
+
+        toast.success("Workflow imported");
+
+        setShowWorkflowImportDialog(false);
+        setPendingWorkflow(null);
+        setResolutionPlan(null);
+      } catch (err) {
+        toast.error("Failed to import workflow", {
+          description: err instanceof Error ? err.message : "Unknown error",
+        });
+      } finally {
+        setIsApplying(false);
+      }
+    },
+    [
+      pendingWorkflow,
+      onSettingsImport,
+      onPromptsChange,
+      resetTimelineUI,
+      loraFiles,
+      _onPromptSubmit,
+    ]
+  );
+
+  /** @deprecated Timeline is now included in the workflow export. */
+  const _handleSaveTimeline = useCallback(() => {
     // Filter out 0-length prompt boxes and only include prompts array and timing
     const exportPrompts = prompts
       .filter(prompt => prompt.startTime !== prompt.endTime) // Exclude 0-length prompt boxes
@@ -466,10 +553,13 @@ export function PromptTimeline({
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
   }, [prompts, settings]);
+  void _handleSaveTimeline; // kept for backward compat, no longer wired to UI
 
   const handleExport = useCallback(() => {
-    setShowExportDialog(true);
-  }, []);
+    if (onSaveWorkflow) {
+      onSaveWorkflow();
+    }
+  }, [onSaveWorkflow]);
 
   const handleImport = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -477,10 +567,27 @@ export function PromptTimeline({
       if (!file) return;
 
       const reader = new FileReader();
-      reader.onload = e => {
+      reader.onload = async e => {
         try {
           const content = e.target?.result as string;
           const timelineData = JSON.parse(content);
+
+          // Detect scope-workflow format
+          if (timelineData.format === "scope-workflow") {
+            const workflow = timelineData as ScopeWorkflow;
+            setPendingWorkflow(workflow);
+            try {
+              const plan = await validateWorkflow(workflow);
+              setResolutionPlan(plan);
+              setShowWorkflowImportDialog(true);
+            } catch (err) {
+              toast.error("Failed to validate workflow", {
+                description:
+                  err instanceof Error ? err.message : "Unknown error",
+              });
+            }
+            return;
+          }
 
           if (timelineData.prompts && Array.isArray(timelineData.prompts)) {
             // Reset timeline UI state to initial values before importing
@@ -753,21 +860,10 @@ export function PromptTimeline({
               <Upload className="h-4 w-4 mr-1" />
               Export
             </Button>
-            <ExportDialog
-              open={showExportDialog}
-              onClose={() => setShowExportDialog(false)}
-              onSaveGeneration={() => {
-                if (onSaveGeneration) {
-                  onSaveGeneration();
-                }
-              }}
-              onSaveTimeline={handleSaveTimeline}
-              isRecording={isRecording}
-            />
             <div className="relative">
               <input
                 type="file"
-                accept=".json"
+                accept=".json,.scope-workflow.json"
                 onChange={handleImport}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                 disabled={disabled || isStreaming || isLoading || isDownloading}
@@ -988,6 +1084,19 @@ export function PromptTimeline({
           </div>
         )}
       </CardContent>
+      <WorkflowImportDialog
+        open={showWorkflowImportDialog}
+        onClose={() => {
+          setShowWorkflowImportDialog(false);
+          setPendingWorkflow(null);
+          setResolutionPlan(null);
+        }}
+        workflow={pendingWorkflow}
+        plan={resolutionPlan}
+        onPlanUpdate={setResolutionPlan}
+        onApply={handleApplyWorkflow}
+        isApplying={isApplying}
+      />
     </Card>
   );
 }

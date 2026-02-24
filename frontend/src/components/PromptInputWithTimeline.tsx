@@ -50,6 +50,7 @@ interface PromptInputWithTimelineProps {
   onSaveGeneration?: () => void;
   isRecording?: boolean;
   onRecordingToggle?: () => void;
+  onSaveWorkflow?: () => void;
 }
 
 export function PromptInputWithTimeline({
@@ -89,6 +90,7 @@ export function PromptInputWithTimeline({
   onSaveGeneration,
   isRecording = false,
   onRecordingToggle,
+  onSaveWorkflow,
 }: PromptInputWithTimelineProps) {
   const [isLive, setIsLive] = useState(false);
   const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
@@ -583,6 +585,7 @@ export function PromptInputWithTimeline({
         onSaveGeneration={onSaveGeneration}
         isRecording={isRecording}
         onRecordingToggle={onRecordingToggle}
+        onSaveWorkflow={onSaveWorkflow}
       />
     </div>
   );
