@@ -69,6 +69,25 @@ def _check_settings(
     return warnings
 
 
+def _check_min_scope_version(
+    min_version_str: str,
+    warnings: list[str],
+) -> None:
+    """Compare *min_version_str* against the installed Scope version."""
+    import importlib.metadata
+
+    try:
+        current_version = Version(importlib.metadata.version("daydream-scope"))
+        min_version = Version(min_version_str)
+        if current_version < min_version:
+            warnings.append(
+                f"This workflow requires Scope >= {min_version_str} "
+                f"(installed: {current_version})"
+            )
+    except (InvalidVersion, importlib.metadata.PackageNotFoundError):
+        warnings.append(f"Could not verify min_scope_version '{min_version_str}'")
+
+
 def resolve_workflow(
     workflow: ScopeWorkflow,
     plugin_manager: Any,
@@ -251,6 +270,10 @@ def resolve_workflow(
         config_class = PipelineRegistry.get_config_class(wp.pipeline_id)
         if config_class is not None:
             settings_warnings.extend(_check_settings(config_class, wp.params))
+
+    # --- min_scope_version check ---
+    if workflow.min_scope_version:
+        _check_min_scope_version(workflow.min_scope_version, settings_warnings)
 
     return WorkflowResolutionPlan(
         can_apply=all_pipelines_ok,
