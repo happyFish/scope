@@ -1,5 +1,6 @@
 """Pipeline processor for running a single pipeline in a thread."""
 
+import contextlib
 import logging
 import queue
 import random
@@ -366,12 +367,15 @@ class PipelineProcessor:
             self._pending_cache_init = True
 
         requirements = None
-        if hasattr(self.pipeline, "prepare"):
-            prepare_params = dict(self.parameters.items())
-            if self._video_mode:
-                # Signal to prepare() that video input is expected
-                prepare_params["video"] = True
-            requirements = self.pipeline.prepare(**prepare_params)
+        _session_lock = getattr(self.pipeline, "_session_lock", None)
+        _lock_ctx = _session_lock if _session_lock is not None else contextlib.nullcontext()
+        with _lock_ctx:
+            if hasattr(self.pipeline, "prepare"):
+                prepare_params = dict(self.parameters.items())
+                if self._video_mode:
+                    # Signal to prepare() that video input is expected
+                    prepare_params["video"] = True
+                requirements = self.pipeline.prepare(**prepare_params)
 
         chunks: dict[str, list[torch.Tensor]] = {}
         if requirements is not None:
@@ -393,130 +397,131 @@ class PipelineProcessor:
             else:
                 chunks = self.prepare_multi_chunk(input_queues_ref, current_chunk_size)
 
-        try:
-            # Pass parameters (excluding prepare-only parameters)
-            call_params = dict(self.parameters.items())
+        with _lock_ctx:
+            try:
+                # Pass parameters (excluding prepare-only parameters)
+                call_params = dict(self.parameters.items())
 
-            # Pass reset_cache as init_cache to pipeline
-            call_params["init_cache"] = not self.is_prepared or self._pending_cache_init
-            if reset_cache:
-                call_params["init_cache"] = True
+                # Pass reset_cache as init_cache to pipeline
+                call_params["init_cache"] = not self.is_prepared or self._pending_cache_init
+                if reset_cache:
+                    call_params["init_cache"] = True
 
-            # Pass lora_scales only when present
-            if lora_scales is not None:
-                call_params["lora_scales"] = lora_scales
+                # Pass lora_scales only when present
+                if lora_scales is not None:
+                    call_params["lora_scales"] = lora_scales
 
-            # Extract ctrl_input, parse it, and reset mouse for next frame
-            if "ctrl_input" in self.parameters:
-                ctrl_data = self.parameters["ctrl_input"]
-                call_params["ctrl_input"] = parse_ctrl_input(ctrl_data)
-                # Reset mouse accumulator, keep key state
-                self.parameters["ctrl_input"]["mouse"] = [0.0, 0.0]
+                # Extract ctrl_input, parse it, and reset mouse for next frame
+                if "ctrl_input" in self.parameters:
+                    ctrl_data = self.parameters["ctrl_input"]
+                    call_params["ctrl_input"] = parse_ctrl_input(ctrl_data)
+                    # Reset mouse accumulator, keep key state
+                    self.parameters["ctrl_input"]["mouse"] = [0.0, 0.0]
 
-            # Fill call_params from stream chunks (port names are set by graph edges)
-            if chunks:
-                for port, frame_list in chunks.items():
-                    call_params[port] = frame_list
+                # Fill call_params from stream chunks (port names are set by graph edges)
+                if chunks:
+                    for port, frame_list in chunks.items():
+                        call_params[port] = frame_list
 
-            if self.tempo_sync is not None:
-                call_params = self._apply_tempo_sync(call_params)
+                if self.tempo_sync is not None:
+                    call_params = self._apply_tempo_sync(call_params)
 
-            processing_start = time.time()
-            output_dict = self.pipeline(**call_params)
-            processing_time = time.time() - processing_start
+                processing_start = time.time()
+                output_dict = self.pipeline(**call_params)
+                processing_time = time.time() - processing_start
 
-            if not output_dict:
-                return
+                if not output_dict:
+                    return
 
-            # Clear one-shot parameters after use to prevent sending them on subsequent chunks
-            # These parameters should only be sent when explicitly provided in parameter updates
-            one_shot_params = [
-                "vace_ref_images",
-                "images",
-                "first_frame_image",
-                "last_frame_image",
-            ]
-            for param in one_shot_params:
-                if param in call_params and param in self.parameters:
-                    self.parameters.pop(param, None)
+                # Clear one-shot parameters after use to prevent sending them on subsequent chunks
+                # These parameters should only be sent when explicitly provided in parameter updates
+                one_shot_params = [
+                    "vace_ref_images",
+                    "images",
+                    "first_frame_image",
+                    "last_frame_image",
+                ]
+                for param in one_shot_params:
+                    if param in call_params and param in self.parameters:
+                        self.parameters.pop(param, None)
 
-            # Clear transition when complete
-            if "transition" in call_params and "transition" in self.parameters:
-                transition_active = False
-                if hasattr(self.pipeline, "state"):
-                    transition_active = self.pipeline.state.get(
-                        "_transition_active", False
+                # Clear transition when complete
+                if "transition" in call_params and "transition" in self.parameters:
+                    transition_active = False
+                    if hasattr(self.pipeline, "state"):
+                        transition_active = self.pipeline.state.get(
+                            "_transition_active", False
+                        )
+
+                    transition = call_params.get("transition")
+                    if not transition_active or transition is None:
+                        self.parameters.pop("transition", None)
+
+                output = output_dict.get("video")
+                num_frames = 0
+                if output is not None:
+                    num_frames = output.shape[0]
+
+                # Put each output port's frames to its queues (all frame ports are streamed)
+                for port, value in output_dict.items():
+                    if value is None or not isinstance(value, torch.Tensor):
+                        continue
+                    queues = self.output_queues.get(port)
+                    if not queues:
+                        continue
+                    # Resize output queues to fit at least one full batch
+                    target_size = value.shape[0] * OUTPUT_QUEUE_MAX_SIZE_FACTOR
+                    self._resize_output_queue(port, target_size)
+                    # Re-read queues after potential resize – _resize_output_queue
+                    # may replace self.output_queues[port] with a new list.
+                    queues = self.output_queues.get(port)
+                    if not queues:
+                        continue
+                    if value.dtype != torch.uint8:
+                        value = (
+                            (value * 255.0)
+                            .clamp(0, 255)
+                            .to(dtype=torch.uint8)
+                            .contiguous()
+                            .detach()
+                        )
+                    frames = [value[i].unsqueeze(0) for i in range(value.shape[0])]
+                    for frame in frames:
+                        for q in queues:
+                            try:
+                                q.put_nowait(frame if q is queues[0] else frame.clone())
+                            except queue.Full:
+                                logger.debug(
+                                    f"Output queue full for {self.pipeline_id} port '{port}', dropping frame"
+                                )
+
+                # Track batch-level throughput for FPS calculation
+                if output is not None and num_frames > 0:
+                    self._track_output_batch(num_frames, processing_time)
+
+                # Forward extra params (non-video outputs without queues) to downstream
+                # pipelines. Preprocessors may return e.g. {"video": frames,
+                # "vace_input_frames": ..., "vace_input_masks": ...} and the extra
+                # entries need to reach the consuming pipeline as parameters.
+                extra_params = {
+                    k: v for k, v in output_dict.items() if k not in self.output_queues
+                }
+                if extra_params and self.output_consumers:
+                    seen: set[int] = set()
+                    for consumers in self.output_consumers.values():
+                        for consumer_proc, _ in consumers:
+                            proc_id = id(consumer_proc)
+                            if proc_id not in seen:
+                                seen.add(proc_id)
+                                consumer_proc.update_parameters(extra_params)
+
+            except Exception as e:
+                if self._is_recoverable(e):
+                    logger.error(
+                        f"Error processing chunk for {self.pipeline_id}: {e}", exc_info=True
                     )
-
-                transition = call_params.get("transition")
-                if not transition_active or transition is None:
-                    self.parameters.pop("transition", None)
-
-            output = output_dict.get("video")
-            num_frames = 0
-            if output is not None:
-                num_frames = output.shape[0]
-
-            # Put each output port's frames to its queues (all frame ports are streamed)
-            for port, value in output_dict.items():
-                if value is None or not isinstance(value, torch.Tensor):
-                    continue
-                queues = self.output_queues.get(port)
-                if not queues:
-                    continue
-                # Resize output queues to fit at least one full batch
-                target_size = value.shape[0] * OUTPUT_QUEUE_MAX_SIZE_FACTOR
-                self._resize_output_queue(port, target_size)
-                # Re-read queues after potential resize – _resize_output_queue
-                # may replace self.output_queues[port] with a new list.
-                queues = self.output_queues.get(port)
-                if not queues:
-                    continue
-                if value.dtype != torch.uint8:
-                    value = (
-                        (value * 255.0)
-                        .clamp(0, 255)
-                        .to(dtype=torch.uint8)
-                        .contiguous()
-                        .detach()
-                    )
-                frames = [value[i].unsqueeze(0) for i in range(value.shape[0])]
-                for frame in frames:
-                    for q in queues:
-                        try:
-                            q.put_nowait(frame if q is queues[0] else frame.clone())
-                        except queue.Full:
-                            logger.debug(
-                                f"Output queue full for {self.pipeline_id} port '{port}', dropping frame"
-                            )
-
-            # Track batch-level throughput for FPS calculation
-            if output is not None and num_frames > 0:
-                self._track_output_batch(num_frames, processing_time)
-
-            # Forward extra params (non-video outputs without queues) to downstream
-            # pipelines. Preprocessors may return e.g. {"video": frames,
-            # "vace_input_frames": ..., "vace_input_masks": ...} and the extra
-            # entries need to reach the consuming pipeline as parameters.
-            extra_params = {
-                k: v for k, v in output_dict.items() if k not in self.output_queues
-            }
-            if extra_params and self.output_consumers:
-                seen: set[int] = set()
-                for consumers in self.output_consumers.values():
-                    for consumer_proc, _ in consumers:
-                        proc_id = id(consumer_proc)
-                        if proc_id not in seen:
-                            seen.add(proc_id)
-                            consumer_proc.update_parameters(extra_params)
-
-        except Exception as e:
-            if self._is_recoverable(e):
-                logger.error(
-                    f"Error processing chunk for {self.pipeline_id}: {e}", exc_info=True
-                )
-            else:
-                raise e
+                else:
+                    raise e
 
         self.is_prepared = True
         self._pending_cache_init = False

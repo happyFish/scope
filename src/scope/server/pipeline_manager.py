@@ -128,7 +128,10 @@ class PipelineManager:
                 raise PipelineNotAvailableException(
                     f"Pipeline {pipeline_id} not available. Status: {status.value}"
                 )
-            return self._pipelines[pipeline_id]
+            pipeline = self._pipelines[pipeline_id]
+            if not hasattr(pipeline, "_session_lock"):
+                pipeline._session_lock = threading.Lock()
+            return pipeline
 
     async def _load_pipeline_by_id(
         self,
