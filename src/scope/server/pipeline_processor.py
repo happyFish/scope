@@ -102,11 +102,6 @@ class PipelineProcessor:
         # Input mode is signaled by the frontend at stream start
         self._video_mode = (initial_parameters or {}).get("input_mode") == "video"
 
-        # Per-session pipeline state: each processor keeps its own PipelineState
-        # reference so shared pipeline objects don't contaminate each other's
-        # frame cache (kv_cache, crossattn_cache, recache_buffer, etc.)
-        self._session_pipeline_state: Any = None
-
         # Maps output port -> list of (consumer_processor, consumer_input_port).
         # Used by _resize_output_queue to update all downstream consumers when
         # a queue is replaced. Populated by graph_executor.build_graph.
@@ -375,8 +370,6 @@ class PipelineProcessor:
         _session_lock = getattr(self.pipeline, "_session_lock", None)
         _lock_ctx = _session_lock if _session_lock is not None else contextlib.nullcontext()
         with _lock_ctx:
-            if hasattr(self.pipeline, "state") and self._session_pipeline_state is not None:
-                self.pipeline.state = self._session_pipeline_state
             if hasattr(self.pipeline, "prepare"):
                 prepare_params = dict(self.parameters.items())
                 if self._video_mode:
@@ -405,9 +398,6 @@ class PipelineProcessor:
                 chunks = self.prepare_multi_chunk(input_queues_ref, current_chunk_size)
 
         with _lock_ctx:
-            # Re-restore: another session may have run between our two lock acquisitions
-            if hasattr(self.pipeline, "state") and self._session_pipeline_state is not None:
-                self.pipeline.state = self._session_pipeline_state
             try:
                 # Pass parameters (excluding prepare-only parameters)
                 call_params = dict(self.parameters.items())
@@ -532,10 +522,6 @@ class PipelineProcessor:
                     )
                 else:
                     raise e
-            finally:
-                # Snapshot updated pipeline state back to this session
-                if hasattr(self.pipeline, "state"):
-                    self._session_pipeline_state = self.pipeline.state
 
         self.is_prepared = True
         self._pending_cache_init = False
