@@ -18,6 +18,8 @@ from scope.core.ndi import (
     NDI_FOURCC_BGRX,
     NDI_FOURCC_RGBA,
     NDI_FOURCC_RGBX,
+    NDI_FRAME_TYPE_AUDIO,
+    NDI_FRAME_TYPE_METADATA,
     NDI_FRAME_TYPE_VIDEO,
     NDIlib_audio_frame_v2_t,
     NDIlib_find_create_t,
@@ -162,6 +164,18 @@ class NDIInputSource(InputSource):
             ctypes.byref(metadata_frame),
             timeout_ms,
         )
+
+        if frame_type == NDI_FRAME_TYPE_AUDIO:
+            self._lib.NDIlib_recv_free_audio_v2(
+                self._recv_instance, ctypes.byref(audio_frame)
+            )
+            return None
+
+        if frame_type == NDI_FRAME_TYPE_METADATA:
+            self._lib.NDIlib_recv_free_metadata(
+                self._recv_instance, ctypes.byref(metadata_frame)
+            )
+            return None
 
         if frame_type != NDI_FRAME_TYPE_VIDEO:
             return None

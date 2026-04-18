@@ -250,6 +250,18 @@ def setup_recv_functions(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(NDIlib_video_frame_v2_t),
     ]
 
+    lib.NDIlib_recv_free_audio_v2.restype = None
+    lib.NDIlib_recv_free_audio_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(NDIlib_audio_frame_v2_t),
+    ]
+
+    lib.NDIlib_recv_free_metadata.restype = None
+    lib.NDIlib_recv_free_metadata.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(NDIlib_metadata_frame_t),
+    ]
+
 
 def setup_send_functions(lib: ctypes.CDLL) -> None:
     """Set up ctypes signatures for NDI sender functions."""
