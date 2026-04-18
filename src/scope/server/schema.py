@@ -329,6 +329,9 @@ class LoRAScaleUpdate(BaseModel):
     )
 
 
+Parameters.model_rebuild()
+
+
 class PipelineLoadParams(BaseModel):
     """Base class for pipeline load parameters."""
 
