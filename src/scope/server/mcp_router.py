@@ -48,21 +48,28 @@ def _get_pipeline_manager() -> "PipelineManager":
 @router.post("/session/parameters")
 async def update_session_parameters(
     parameters: Parameters,
+    session_id: str | None = None,
     webrtc_manager: "WebRTCManager" = Depends(_get_webrtc_manager),
 ):
-    """Update runtime parameters for all active WebRTC sessions.
+    """Update runtime parameters for active sessions.
 
-    Applies parameter changes to the pipeline (same path as the WebRTC data
-    channel) and notifies connected frontends so their UI stays in sync.
+    If session_id is provided, only updates that specific headless session.
+    Otherwise applies to all active sessions (WebRTC and headless).
     """
     params_dict = parameters.model_dump(exclude_none=True)
     if not params_dict:
         raise HTTPException(status_code=400, detail="No parameters provided")
 
-    webrtc_manager.broadcast_parameter_update(params_dict)
-    webrtc_manager.broadcast_notification(
-        {"type": "parameters_updated", "parameters": params_dict}
-    )
+    if session_id:
+        hs = webrtc_manager.headless_sessions.get(session_id)
+        if not hs:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        hs.frame_processor.update_parameters(params_dict)
+    else:
+        webrtc_manager.broadcast_parameter_update(params_dict)
+        webrtc_manager.broadcast_notification(
+            {"type": "parameters_updated", "parameters": params_dict}
+        )
 
     return {"status": "ok", "applied_parameters": params_dict}
 
@@ -131,13 +138,19 @@ async def get_session_metrics(
     usage when CUDA is available.
     """
     session_stats = {}
-    result = webrtc_manager.get_frame_processor()
-    if result:
-        sid, fp, is_headless = result
-        if not (is_headless and not fp.running):
-            stats = fp.get_frame_stats()
-            if is_headless:
-                stats["headless"] = True
+    # WebRTC sessions
+    for sid, session in webrtc_manager.sessions.items():
+        if session.pc.connectionState in ("closed", "failed"):
+            continue
+        if session.video_track and getattr(session.video_track, "frame_processor", None):
+            stats = session.video_track.frame_processor.get_frame_stats()
+            stats["headless"] = False
+            session_stats[sid] = stats
+    # Headless sessions (all of them)
+    for sid, hs in webrtc_manager.headless_sessions.items():
+        if hs.frame_processor and hs.frame_processor.running:
+            stats = hs.frame_processor.get_frame_stats()
+            stats["headless"] = True
             session_stats[sid] = stats
 
     gpu_info = {}
@@ -219,11 +232,13 @@ async def start_stream(
             frame_processor=frame_processor,
         )
         session.start_frame_consumer()
-        webrtc_manager.add_headless_session(session)
+        session_id = frame_processor.session_id
+        webrtc_manager.add_headless_session(session_id, session)
 
-        logger.info(f"Started headless session with pipeline {request.pipeline_id}")
+        logger.info(f"Started headless session {session_id} with pipeline {request.pipeline_id}")
         return {
             "status": "ok",
+            "session_id": session_id,
             "pipeline_id": request.pipeline_id,
             "input_mode": request.input_mode,
         }
@@ -234,16 +249,52 @@ async def start_stream(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@router.post("/session/stop")
-async def stop_stream(
+class ViewerAttachRequest(BaseModel):
+    session_id: str
+    sdp: str
+    type: str
+
+
+@router.post("/viewer/attach")
+async def attach_viewer(
+    request: ViewerAttachRequest,
     webrtc_manager: "WebRTCManager" = Depends(_get_webrtc_manager),
 ):
-    """Stop the active headless pipeline session."""
-    if not webrtc_manager.headless_session:
-        raise HTTPException(status_code=404, detail="No active headless session")
+    """Attach a WebRTC viewer to an existing headless session.
+
+    Takes a standard WebRTC offer (sdp + type) and the target headless
+    `session_id`. Returns an SDP answer plus the new viewer session id.
+    The viewer subscribes to the headless session's frame relay; no extra
+    pipeline runs.
+    """
+    if request.session_id not in webrtc_manager.headless_sessions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Headless session not found: {request.session_id}",
+        )
     try:
-        await webrtc_manager.remove_headless_session()
-        return {"status": "ok", "message": "Headless session stopped"}
+        return await webrtc_manager.handle_viewer_attach(
+            request.session_id, request.sdp, request.type
+        )
+    except Exception as e:
+        logger.error(f"viewer/attach failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/session/stop")
+async def stop_stream(
+    session_id: str | None = None,
+    webrtc_manager: "WebRTCManager" = Depends(_get_webrtc_manager),
+):
+    """Stop a headless pipeline session by ID, or all sessions if no ID given."""
+    if session_id and session_id not in webrtc_manager.headless_sessions:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    if not session_id and not webrtc_manager.headless_sessions:
+        raise HTTPException(status_code=404, detail="No active headless sessions")
+    try:
+        await webrtc_manager.remove_headless_session(session_id)
+        msg = f"Session {session_id} stopped" if session_id else "All sessions stopped"
+        return {"status": "ok", "message": msg}
     except Exception as e:
         logger.error(f"Error stopping headless session: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e

@@ -19,7 +19,7 @@ class VideoProcessingTrack(MediaStreamTrack):
 
     def __init__(
         self,
-        pipeline_manager: PipelineManager,
+        pipeline_manager: PipelineManager | None = None,
         fps: int = 30,
         initial_parameters: dict = None,
         notification_callback: callable = None,
@@ -28,6 +28,7 @@ class VideoProcessingTrack(MediaStreamTrack):
         connection_id: str | None = None,
         connection_info: dict | None = None,
         tempo_sync=None,
+        frame_processor: "FrameProcessor | None" = None,
     ):
         super().__init__()
         self.pipeline_manager = pipeline_manager
@@ -42,7 +43,10 @@ class VideoProcessingTrack(MediaStreamTrack):
         self.fps = fps
         self.frame_ptime = 1.0 / fps
 
-        self.frame_processor = None
+        # Viewer mode: pre-supplied FrameProcessor owned by another session
+        # (e.g. a HeadlessSession). The track must NOT create or stop it.
+        self.frame_processor = frame_processor
+        self._owns_frame_processor = frame_processor is None
         self.input_task = None
         self.input_task_running = False
         self._paused = False
@@ -60,6 +64,10 @@ class VideoProcessingTrack(MediaStreamTrack):
                 logger.info(
                     f"Input source mode enabled: {input_source.get('source_type')}"
                 )
+        # Viewer-mode tracks always read; the FrameProcessor's lifecycle is
+        # external. Treat this as a perpetual "input source" for recv() loops.
+        if frame_processor is not None:
+            self._input_source_enabled = True
 
     async def input_loop(self):
         """Background loop that continuously feeds frames to the processor"""
@@ -124,6 +132,11 @@ class VideoProcessingTrack(MediaStreamTrack):
 
     def initialize_output_processing(self):
         if not self.frame_processor:
+            if self.pipeline_manager is None:
+                raise RuntimeError(
+                    "VideoProcessingTrack has no frame_processor and no "
+                    "pipeline_manager — cannot lazily create one"
+                )
             self.frame_processor = FrameProcessor(
                 pipeline_manager=self.pipeline_manager,
                 initial_parameters=self.initial_parameters,
@@ -211,7 +224,9 @@ class VideoProcessingTrack(MediaStreamTrack):
             except asyncio.CancelledError:
                 pass
 
-        if self.frame_processor is not None:
+        # Only stop the FrameProcessor if we created it. In viewer mode the
+        # FrameProcessor is owned by the HeadlessSession and must outlive us.
+        if self.frame_processor is not None and self._owns_frame_processor:
             self.frame_processor.stop()
 
         super().stop()

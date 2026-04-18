@@ -197,7 +197,7 @@ class WebRTCManager:
 
     def __init__(self):
         self.sessions: dict[str, Session] = {}
-        self.headless_session: HeadlessSession | None = None
+        self.headless_sessions: dict[str, HeadlessSession] = {}
         self.rtc_config = create_rtc_config()
         self.is_first_track = True
 
@@ -638,18 +638,78 @@ class WebRTCManager:
             ]
         )
 
-    def add_headless_session(self, session: HeadlessSession) -> None:
-        """Register the headless session (only one supported at a time)."""
-        self.headless_session = session
+    def add_headless_session(self, session_id: str, session: HeadlessSession) -> None:
+        """Register a headless session. Multiple sessions are supported simultaneously."""
+        self.headless_sessions[session_id] = session
 
-    async def remove_headless_session(self) -> None:
-        """Stop and remove the active headless session."""
-        session = self.headless_session
-        self.headless_session = None
-        if session:
-            await session.close()
+    async def handle_viewer_attach(
+        self,
+        headless_session_id: str,
+        sdp: str,
+        type_: str,
+    ) -> dict[str, Any]:
+        """Negotiate a WebRTC viewer that subscribes to an existing headless
+        session's frame stream. The viewer does NOT own the FrameProcessor —
+        it just relays frames out. Multiple viewers can attach to the same
+        headless session simultaneously.
+        """
+        headless = self.headless_sessions.get(headless_session_id)
+        if headless is None:
+            raise ValueError(f"Headless session not found: {headless_session_id}")
+
+        pc = RTCPeerConnection(self.rtc_config)
+        session = Session(pc)
+        self.sessions[session.id] = session
+
+        # Subscribe to the headless session's relay. This shares the underlying
+        # VideoProcessingTrack across all subscribers (primary consumer +
+        # viewers) without spinning up another pipeline.
+        relayed_track = headless.relay.subscribe(headless.video_track, buffered=False)
+        pc.addTrack(relayed_track)
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            logger.info(
+                f"Viewer connection state changed to: {pc.connectionState} "
+                f"for session {session.id} (viewing {headless_session_id})"
+            )
+            if pc.connectionState in ("closed", "failed"):
+                await self.remove_session(session.id)
+
+        @pc.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange():
+            logger.info(
+                f"Viewer ICE state changed to: {pc.iceConnectionState} "
+                f"for session {session.id}"
+            )
+
+        offer_sdp = RTCSessionDescription(sdp=sdp, type=type_)
+        await pc.setRemoteDescription(offer_sdp)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        logger.info(
+            f"Viewer attached: session={session.id} → headless={headless_session_id}"
+        )
+        return {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+            "sessionId": session.id,
+            "headlessSessionId": headless_session_id,
+        }
+
+    async def remove_headless_session(self, session_id: str | None = None) -> None:
+        """Stop and remove a headless session by ID, or all sessions if no ID given."""
+        if session_id is not None:
+            session = self.headless_sessions.pop(session_id, None)
+            if session:
+                await session.close()
+            else:
+                logger.warning(f"Attempted to remove non-existent headless session: {session_id}")
         else:
-            logger.warning("Attempted to remove non-existent headless session")
+            sessions = list(self.headless_sessions.values())
+            self.headless_sessions.clear()
+            await asyncio.gather(*[s.close() for s in sessions], return_exceptions=True)
 
     async def add_ice_candidate(
         self,
@@ -701,8 +761,9 @@ class WebRTCManager:
                 and session.video_track.frame_processor
             ):
                 return sid, session.video_track.frame_processor, False
-        if self.headless_session and self.headless_session.frame_processor:
-            return "headless", self.headless_session.frame_processor, True
+        for sid, hs in self.headless_sessions.items():
+            if hs.frame_processor:
+                return sid, hs.frame_processor, True
         return None
 
     def get_last_frame(self):
@@ -712,8 +773,8 @@ class WebRTCManager:
                 frame = session.video_track.get_last_frame()
                 if frame is not None:
                     return frame
-        if self.headless_session:
-            frame = self.headless_session.get_last_frame()
+        for hs in self.headless_sessions.values():
+            frame = hs.get_last_frame()
             if frame is not None:
                 return frame
         return None
@@ -725,10 +786,11 @@ class WebRTCManager:
                 continue
             if "paused" in parameters and session.video_track:
                 session.video_track.pause(parameters["paused"])
-            if session.video_track and hasattr(session.video_track, "frame_processor"):
+            if session.video_track and getattr(session.video_track, "frame_processor", None):
                 session.video_track.frame_processor.update_parameters(parameters)
-        if self.headless_session and self.headless_session.frame_processor:
-            self.headless_session.frame_processor.update_parameters(parameters)
+        for hs in self.headless_sessions.values():
+            if hs.frame_processor:
+                hs.frame_processor.update_parameters(parameters)
 
     def broadcast_notification(self, message: dict) -> None:
         """Send a notification message to all active sessions via their data channels."""
@@ -747,13 +809,12 @@ class WebRTCManager:
     async def stop(self):
         """Close and cleanup all sessions (WebRTC and headless)."""
         close_tasks = [session.close() for session in self.sessions.values()]
-        if self.headless_session:
-            close_tasks.append(self.headless_session.close())
+        close_tasks += [hs.close() for hs in self.headless_sessions.values()]
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
         self.sessions.clear()
-        self.headless_session = None
+        self.headless_sessions.clear()
 
 
 def create_rtc_config() -> RTCConfiguration:
