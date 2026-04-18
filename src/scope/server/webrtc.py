@@ -698,6 +698,110 @@ class WebRTCManager:
             "headlessSessionId": headless_session_id,
         }
 
+    async def handle_controller_attach(
+        self,
+        headless_session_id: str,
+        sdp: str,
+        type_: str,
+    ) -> dict[str, Any]:
+        """Negotiate a WebRTC controller that subscribes to an existing headless
+        session's frame stream AND accepts a data channel for parameter control.
+
+        Like ``handle_viewer_attach`` the controller does NOT own the
+        FrameProcessor — it attaches to a running headless session.  Unlike a
+        viewer, the controller can send parameter updates over the data channel
+        which are routed directly to the headless session's FrameProcessor.
+        Notifications (``parameters_updated``, ``tempo_update``, …) are echoed
+        back over the same channel.
+        """
+        headless = self.headless_sessions.get(headless_session_id)
+        if headless is None:
+            raise ValueError(f"Headless session not found: {headless_session_id}")
+
+        pc = RTCPeerConnection(self.rtc_config)
+        session = Session(pc)
+        self.sessions[session.id] = session
+
+        # Video: subscribe to the headless session's relay (same as viewer).
+        relayed_track = headless.relay.subscribe(headless.video_track, buffered=False)
+        pc.addTrack(relayed_track)
+
+        # Wire a NotificationSender so Scope can push param echoes and tempo
+        # updates back to the controller over the data channel.
+        notification_sender = NotificationSender()
+        session.notification_sender = notification_sender
+        headless.frame_processor.notification_callback = notification_sender.call
+
+        # Accept the browser-initiated data channel and route messages to the
+        # headless session's FrameProcessor (same handling as handle_offer).
+        @pc.on("datachannel")
+        def on_data_channel(data_channel):
+            logger.info(
+                f"Controller data channel received: {data_channel.label} "
+                f"for session {session.id} (controlling {headless_session_id})"
+            )
+            session.data_channel = data_channel
+            notification_sender.set_data_channel(data_channel)
+
+            @data_channel.on("open")
+            def on_data_channel_open():
+                logger.info(f"Controller data channel opened for session {session.id}")
+                notification_sender.flush_pending_notifications()
+
+            @data_channel.on("message")
+            def on_data_channel_message(message):
+                try:
+                    data = json.loads(message)
+                    logger.debug(f"Controller param update: {data}")
+
+                    # Pause/unpause is always immediate.
+                    if "paused" in data:
+                        headless.video_track.pause(data["paused"])
+
+                    # Quantized updates are scheduled for next beat boundary.
+                    if data.pop("_quantized", False):
+                        headless.frame_processor.schedule_quantized_update(data)
+                        return
+
+                    # Everything else goes straight to the frame processor.
+                    headless.frame_processor.update_parameters(data)
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"Controller: failed to parse message: {e}")
+                except Exception as e:
+                    logger.error(f"Controller: error handling param update: {e}")
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            logger.info(
+                f"Controller connection state changed to: {pc.connectionState} "
+                f"for session {session.id} (controlling {headless_session_id})"
+            )
+            if pc.connectionState in ("closed", "failed"):
+                await self.remove_session(session.id)
+
+        @pc.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange():
+            logger.info(
+                f"Controller ICE state changed to: {pc.iceConnectionState} "
+                f"for session {session.id}"
+            )
+
+        offer_sdp = RTCSessionDescription(sdp=sdp, type=type_)
+        await pc.setRemoteDescription(offer_sdp)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        logger.info(
+            f"Controller attached: session={session.id} → headless={headless_session_id}"
+        )
+        return {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+            "sessionId": session.id,
+            "headlessSessionId": headless_session_id,
+        }
+
     async def remove_headless_session(self, session_id: str | None = None) -> None:
         """Stop and remove a headless session by ID, or all sessions if no ID given."""
         if session_id is not None:

@@ -281,6 +281,32 @@ async def attach_viewer(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.post("/controller/attach")
+async def attach_controller(
+    request: ViewerAttachRequest,
+    webrtc_manager: "WebRTCManager" = Depends(_get_webrtc_manager),
+):
+    """Attach a WebRTC controller to an existing headless session.
+
+    Same SDP handshake as ``/viewer/attach`` but the controller also
+    negotiates a data channel for parameter control.  Parameter messages
+    sent over the channel are routed directly to the headless session's
+    FrameProcessor.  Notifications are echoed back over the same channel.
+    """
+    if request.session_id not in webrtc_manager.headless_sessions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Headless session not found: {request.session_id}",
+        )
+    try:
+        return await webrtc_manager.handle_controller_attach(
+            request.session_id, request.sdp, request.type
+        )
+    except Exception as e:
+        logger.error(f"controller/attach failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.post("/session/stop")
 async def stop_stream(
     session_id: str | None = None,
