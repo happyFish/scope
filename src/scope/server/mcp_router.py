@@ -184,10 +184,12 @@ async def get_session_metrics(
 
 
 class StartStreamRequest(BaseModel):
-    pipeline_id: str
+    pipeline_id: str | None = None
+    pipeline_ids: list[str] | None = None
     input_mode: str = "text"
     prompts: list[dict] | None = None
     input_source: dict | None = None
+    graph: dict | None = None
 
 
 @router.post("/session/start")
@@ -201,19 +203,30 @@ async def start_stream(
     Creates a FrameProcessor directly and begins generating frames.
     Use capture_frame to see output, update_parameters to control it,
     and POST /api/v1/session/stop to tear it down.
+
+    Accepts either ``pipeline_id`` (single) or ``pipeline_ids`` (list).
+    When multiple pipelines are provided with a ``graph`` config, the
+    session uses graph execution mode to wire them together.
     """
     from .frame_processor import FrameProcessor
     from .headless import HeadlessSession
 
+    # Resolve pipeline list — pipeline_ids takes precedence.
+    ids = request.pipeline_ids or ([request.pipeline_id] if request.pipeline_id else [])
+    if not ids:
+        raise HTTPException(status_code=400, detail="pipeline_id or pipeline_ids required")
+
     # Build initial parameters
     initial_params: dict = {
-        "pipeline_ids": [request.pipeline_id],
+        "pipeline_ids": ids,
         "input_mode": request.input_mode,
     }
     if request.prompts is not None:
         initial_params["prompts"] = request.prompts
     if request.input_source is not None:
         initial_params["input_source"] = request.input_source
+    if request.graph is not None:
+        initial_params["graph"] = request.graph
 
     try:
         frame_processor = FrameProcessor(
@@ -235,11 +248,11 @@ async def start_stream(
         session_id = frame_processor.session_id
         webrtc_manager.add_headless_session(session_id, session)
 
-        logger.info(f"Started headless session {session_id} with pipeline {request.pipeline_id}")
+        logger.info(f"Started headless session {session_id} with pipelines {ids}")
         return {
             "status": "ok",
             "session_id": session_id,
-            "pipeline_id": request.pipeline_id,
+            "pipeline_ids": ids,
             "input_mode": request.input_mode,
         }
     except HTTPException:
