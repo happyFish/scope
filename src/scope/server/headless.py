@@ -14,7 +14,7 @@ would only flow when a viewer was attached).
 import asyncio
 import logging
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from aiortc.contrib.media import MediaRelay
 
@@ -41,6 +41,21 @@ class HeadlessSession:
         self._frame_consumer_running = False
         self._frame_consumer_task: asyncio.Task | None = None
 
+        # Fan-out for notifications (param echoes, tempo updates, stream_stopped).
+        # Multiple controllers may attach to the same headless session; each
+        # one registers its own sender here. FrameProcessor sees a single
+        # callback and doesn't need to know about controllers.
+        self._notification_subscribers: list[Callable[[dict], None]] = []
+        self._notification_subscribers_lock = threading.Lock()
+        frame_processor.notification_callback = self._dispatch_notification
+        # ParameterScheduler captures its own callback reference at
+        # construction time, so update it too if present (used for tempo /
+        # quantized-update notifications).
+        if getattr(frame_processor, "parameter_scheduler", None) is not None:
+            frame_processor.parameter_scheduler._notification_callback = (
+                self._dispatch_notification
+            )
+
         # Wrap the FrameProcessor in a viewer-mode track + MediaRelay so
         # WebRTC viewers can subscribe without spawning a duplicate pipeline.
         self.video_track = VideoProcessingTrack(
@@ -52,6 +67,39 @@ class HeadlessSession:
         # from. It also keeps the underlying track alive so recv() is driven
         # even when no external viewer is attached.
         self._primary_relay_track = self.relay.subscribe(self.video_track, buffered=False)
+
+    def add_notification_subscriber(self, callback: Callable[[dict], None]) -> None:
+        """Register a callback that receives every frame-processor notification
+        (param echoes, tempo updates, stream_stopped). Safe to call from any
+        thread. One per attached controller."""
+        with self._notification_subscribers_lock:
+            if callback not in self._notification_subscribers:
+                self._notification_subscribers.append(callback)
+
+    def remove_notification_subscriber(self, callback: Callable[[dict], None]) -> None:
+        """Unregister a previously-added subscriber. No-op if not present."""
+        with self._notification_subscribers_lock:
+            try:
+                self._notification_subscribers.remove(callback)
+            except ValueError:
+                pass
+
+    def _dispatch_notification(self, message: dict) -> None:
+        """Fan out one notification to every registered subscriber. Exceptions
+        in one subscriber must not prevent the others from being called."""
+        with self._notification_subscribers_lock:
+            subscribers = list(self._notification_subscribers)
+        for cb in subscribers:
+            try:
+                cb(message)
+            except Exception as e:
+                logger.error(f"Notification subscriber failed: {e}", exc_info=True)
+
+    def broadcast_notification(self, message: dict) -> None:
+        """Public fan-out entry. Use this when the caller already has an
+        outgoing notification to push to every attached controller (e.g. a
+        DC-driven parameter update that needs to sync to peer controllers)."""
+        self._dispatch_notification(message)
 
     def start_frame_consumer(self):
         """Start a background task that continuously pulls frames to keep the

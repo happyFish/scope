@@ -603,6 +603,16 @@ class WebRTCManager:
             session = self.sessions.pop(session_id)
             logger.info(f"Removing session: {session}")
 
+            # If this was a controller attached to a headless session,
+            # unsubscribe its NotificationSender so it doesn't accumulate
+            # across controller attach/detach cycles.
+            headless_id = getattr(session, "headless_session_id", None)
+            notification_sender = getattr(session, "notification_sender", None)
+            if headless_id and notification_sender is not None:
+                headless = self.headless_sessions.get(headless_id)
+                if headless is not None:
+                    headless.remove_notification_subscriber(notification_sender.call)
+
             # Delete recording file when session ends
             if session.recording_manager:
                 await session.recording_manager.delete_recording()
@@ -727,10 +737,13 @@ class WebRTCManager:
         pc.addTrack(relayed_track)
 
         # Wire a NotificationSender so Scope can push param echoes and tempo
-        # updates back to the controller over the data channel.
+        # updates back to the controller over the data channel. Registered as
+        # a subscriber on the HeadlessSession so multiple controllers attached
+        # to the same headless all receive notifications.
         notification_sender = NotificationSender()
         session.notification_sender = notification_sender
-        headless.frame_processor.notification_callback = notification_sender.call
+        session.headless_session_id = headless_session_id  # for detach cleanup
+        headless.add_notification_subscriber(notification_sender.call)
 
         # Accept the browser-initiated data channel and route messages to the
         # headless session's FrameProcessor (same handling as handle_offer).
@@ -766,6 +779,15 @@ class WebRTCManager:
                     # Everything else goes straight to the frame processor.
                     headless.frame_processor.update_parameters(data)
 
+                    # Fan out a parameters_updated notification to every
+                    # attached controller so peer clients' UIs stay in sync.
+                    # The HTTP endpoint does this already (see mcp_router);
+                    # the DC path used to skip it, leaving second-client UIs
+                    # stale after the first client writes a param.
+                    headless.broadcast_notification(
+                        {"type": "parameters_updated", "parameters": data}
+                    )
+
                 except json.JSONDecodeError as e:
                     logger.error(f"Controller: failed to parse message: {e}")
                 except Exception as e:
@@ -793,7 +815,8 @@ class WebRTCManager:
         await pc.setLocalDescription(answer)
 
         logger.info(
-            f"Controller attached: session={session.id} → headless={headless_session_id}"
+            f"Controller attached: session={session.id} → headless={headless_session_id} "
+            f"(total_attachments={len(self.sessions)})"
         )
         return {
             "sdp": pc.localDescription.sdp,
