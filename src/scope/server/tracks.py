@@ -179,9 +179,22 @@ class VideoProcessingTrack(MediaStreamTrack):
                     # When video is not paused, get the next frame from the frame processor
                     frame_tensor = self.frame_processor.get()
                     if frame_tensor is not None:
-                        frame = VideoFrame.from_ndarray(
+                        # Build the rgb24 frame, then immediately reformat to
+                        # yuv420p on this (single) recv thread.
+                        #
+                        # Why: when the MediaRelay has multiple subscribers
+                        # (e.g. two controllers attached to the same headless
+                        # session), each encoder thread would otherwise call
+                        # `frame.reformat(format="yuv420p")` concurrently in
+                        # aiortc/codecs/vpx.py. That hits libswscale from
+                        # multiple threads with shared state and segfaults
+                        # (reproduced as SIGSEGV on 2nd controller attach).
+                        # Doing the conversion once here keeps all swscale
+                        # work on a single thread.
+                        rgb_frame = VideoFrame.from_ndarray(
                             frame_tensor.numpy(), format="rgb24"
                         )
+                        frame = rgb_frame.reformat(format="yuv420p")
 
                 if frame is not None:
                     pts, time_base = await self.next_timestamp()

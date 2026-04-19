@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import faulthandler
 import io
 import json
 import logging
@@ -9,6 +10,11 @@ import sys
 import threading
 import time
 import warnings
+
+# Dump a C-level traceback to stderr on SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL.
+# Scope depends on several native extensions (aiortc codecs, PyAV, CUDA/torch)
+# where crashes surface as bare segfaults with no Python stack otherwise.
+faulthandler.enable()
 import webbrowser
 from contextlib import asynccontextmanager
 from datetime import datetime
