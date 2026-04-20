@@ -2,7 +2,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { OutputSinkToggle } from "./OutputSinkToggle";
 import { PARAMETER_METADATA } from "../data/parameterMetadata";
 import type { SettingsState } from "../types";
-
 interface OutputsPanelProps {
   className?: string;
   outputSinks?: SettingsState["outputSinks"];
@@ -25,6 +24,13 @@ export function OutputsPanel({
   syphonAvailable = false,
   isStreaming = false,
 }: OutputsPanelProps) {
+  const handleOutputSinkChange = (
+    sinkType: string,
+    config: { enabled: boolean; name: string }
+  ) => {
+    onOutputSinkChange?.(sinkType, config);
+  };
+
   return (
     <Card className={className}>
       <CardHeader className="px-4 py-3">
@@ -40,7 +46,7 @@ export function OutputsPanel({
             defaultName="ScopeOut"
             enabled={outputSinks?.spout?.enabled ?? false}
             name={outputSinks?.spout?.name ?? "ScopeOut"}
-            onOutputSinkChange={onOutputSinkChange}
+            onOutputSinkChange={handleOutputSinkChange}
             isStreaming={isStreaming}
           />
         )}
@@ -54,7 +60,7 @@ export function OutputsPanel({
             defaultName="Scope"
             enabled={outputSinks?.ndi?.enabled ?? false}
             name={outputSinks?.ndi?.name ?? "Scope"}
-            onOutputSinkChange={onOutputSinkChange}
+            onOutputSinkChange={handleOutputSinkChange}
             isStreaming={isStreaming}
           />
         )}
@@ -68,7 +74,7 @@ export function OutputsPanel({
             defaultName="Scope"
             enabled={outputSinks?.syphon?.enabled ?? false}
             name={outputSinks?.syphon?.name ?? "Scope"}
-            onOutputSinkChange={onOutputSinkChange}
+            onOutputSinkChange={handleOutputSinkChange}
             isStreaming={isStreaming}
           />
         )}

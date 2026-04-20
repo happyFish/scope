@@ -7,12 +7,15 @@ import { PluginsProvider } from "./contexts/PluginsContext";
 import { ServerInfoProvider } from "./contexts/ServerInfoContext";
 import { CloudProvider } from "./lib/cloudContext";
 import { CloudStatusProvider } from "./hooks/useCloudStatus";
+import { OnboardingProvider } from "./contexts/OnboardingContext";
+import { BillingProvider } from "./contexts/BillingContext";
 import {
   handleOAuthCallback,
   initElectronAuthListener,
   initEnvKeyAuth,
 } from "./lib/auth";
 import { toast } from "sonner";
+import { TelemetryProvider } from "./contexts/TelemetryContext";
 import "./index.css";
 
 // Get cloud WebSocket URL and API key from environment variables
@@ -103,20 +106,26 @@ function App() {
   }
 
   return (
-    <CloudStatusProvider>
-      <PipelinesProvider>
-        <LoRAsProvider>
-          <PluginsProvider>
-            <ServerInfoProvider>
-              <CloudProvider wsUrl={CLOUD_WS_URL} apiKey={CLOUD_KEY}>
-                <StreamPage />
-              </CloudProvider>
-            </ServerInfoProvider>
-          </PluginsProvider>
-          <Toaster />
-        </LoRAsProvider>
-      </PipelinesProvider>
-    </CloudStatusProvider>
+    <TelemetryProvider>
+      <CloudStatusProvider>
+        <BillingProvider>
+          <PipelinesProvider>
+            <LoRAsProvider>
+              <PluginsProvider>
+                <ServerInfoProvider>
+                  <CloudProvider wsUrl={CLOUD_WS_URL} apiKey={CLOUD_KEY}>
+                    <OnboardingProvider>
+                      <StreamPage />
+                    </OnboardingProvider>
+                  </CloudProvider>
+                </ServerInfoProvider>
+              </PluginsProvider>
+              <Toaster />
+            </LoRAsProvider>
+          </PipelinesProvider>
+        </BillingProvider>
+      </CloudStatusProvider>
+    </TelemetryProvider>
   );
 }
 

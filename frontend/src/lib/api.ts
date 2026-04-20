@@ -22,6 +22,7 @@ export interface WebRTCOfferRequest {
   sdp?: string;
   type?: string;
   initialParameters?: {
+    input_mode?: "text" | "video";
     prompts?: string[] | PromptItem[];
     prompt_interpolation_method?: "linear" | "slerp";
     transition?: PromptTransition;
@@ -34,6 +35,7 @@ export interface WebRTCOfferRequest {
     vace_context_scale?: number;
     pipeline_ids?: string[];
     images?: string[];
+    graph?: GraphConfig;
   };
 }
 
@@ -45,8 +47,15 @@ export interface PipelineLoadParams {
 // Generic load params - accepts any key-value pairs based on pipeline config
 export type PipelineLoadParamsGeneric = Record<string, unknown>;
 
+export interface PipelineLoadItem {
+  node_id: string;
+  pipeline_id: string;
+  load_params?: PipelineLoadParamsGeneric | null;
+}
+
 export interface PipelineLoadRequest {
-  pipeline_ids: string[];
+  pipelines?: PipelineLoadItem[];
+  pipeline_ids?: string[];
   load_params?: PipelineLoadParamsGeneric | null;
 }
 
@@ -58,6 +67,10 @@ export interface PipelineStatusResponse {
   loaded_lora_adapters?: { path: string; scale: number }[];
   error?: string;
   loading_stage?: string | null;
+  /** Whether the loaded pipeline chain produces video output. */
+  produces_video?: boolean;
+  /** Whether the loaded pipeline chain produces audio output. */
+  produces_audio?: boolean;
 }
 
 export const getIceServers = async (): Promise<IceServersResponse> => {
@@ -328,9 +341,15 @@ export const getInputSourceResolution = async (
 export const getInputSourceStreamUrl = (
   sourceType: string,
   identifier: string,
-  fps = 2
-): string =>
-  `/api/v1/input-sources/${sourceType}/sources/${encodeURIComponent(identifier)}/stream?fps=${fps}`;
+  fps = 2,
+  options?: { flipVertical?: boolean }
+): string => {
+  const params = new URLSearchParams({ fps: String(fps) });
+  if (options?.flipVertical) {
+    params.set("flip_vertical", "true");
+  }
+  return `/api/v1/input-sources/${sourceType}/sources/${encodeURIComponent(identifier)}/stream?${params.toString()}`;
+};
 
 export const fetchCurrentLogs = async (): Promise<string> => {
   const response = await fetch("/api/v1/logs/current", {
@@ -364,6 +383,7 @@ export interface LoRAFileInfo {
   folder?: string | null;
   sha256?: string | null;
   provenance?: LoRAProvenance | null;
+  read_only?: boolean;
 }
 
 export interface LoRAFilesResponse {
@@ -439,7 +459,7 @@ export interface AssetFileInfo {
   path: string;
   size_mb: number;
   folder?: string | null;
-  type: string; // "image" or "video"
+  type: string; // "image", "video", or "audio"
   created_at: number; // Unix timestamp
 }
 
@@ -448,7 +468,7 @@ export interface AssetsResponse {
 }
 
 export const listAssets = async (
-  type?: "image" | "video"
+  type?: "image" | "video" | "audio"
 ): Promise<AssetsResponse> => {
   const url = type ? `/api/v1/assets?type=${type}` : "/api/v1/assets";
   const response = await fetch(url, {
@@ -556,6 +576,7 @@ export interface PipelineSchemaProperty {
   $ref?: string;
   /** UI hints from backend (Field json_schema_extra) */
   ui?: SchemaFieldUI;
+  [k: string]: unknown;
 }
 
 export interface PipelineConfigSchema {
@@ -607,6 +628,9 @@ export interface PipelineSchemaInfo {
   recommended_quantization_vram_threshold: number | null;
   modified: boolean;
   plugin_name: string | null;
+  // Graph port declarations
+  inputs?: string[];
+  outputs?: string[];
 }
 
 export interface PipelineSchemasResponse {
@@ -649,6 +673,7 @@ export interface PluginInfo {
   latest_version: string | null;
   update_available: boolean | null;
   package_spec: string | null;
+  bundled: boolean;
 }
 
 export interface FailedPluginInfo {
@@ -884,12 +909,49 @@ export const deleteApiKey = async (
   return response.json();
 };
 
-export const downloadRecording = async (sessionId: string): Promise<void> => {
+// Graph Configuration types
+
+export interface GraphNode {
+  id: string;
+  type: "source" | "pipeline" | "sink" | "record";
+  pipeline_id?: string | null;
+  x?: number | null;
+  y?: number | null;
+  w?: number | null;
+  h?: number | null;
+  source_mode?: string | null;
+  source_name?: string | null;
+  source_flip_vertical?: boolean;
+  tempo_sync?: boolean;
+  sink_mode?: string | null;
+  sink_name?: string | null;
+}
+
+export interface GraphEdge {
+  from: string;
+  from_port: string;
+  to_node: string;
+  to_port: string;
+  kind?: "stream" | "parameter";
+}
+
+export interface GraphConfig {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  /** Opaque frontend UI state (frontend-only nodes, edges, etc.). Stored and returned as-is by the backend. */
+  ui_state?: Record<string, unknown> | null;
+}
+
+export const downloadRecording = async (
+  sessionId: string,
+  nodeId?: string
+): Promise<void> => {
   if (!sessionId) {
     throw new Error("Session ID is required to download recording");
   }
 
-  const response = await fetch(`/api/v1/recordings/${sessionId}`, {
+  const params = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  const response = await fetch(`/api/v1/recordings/${sessionId}${params}`, {
     method: "GET",
   });
 
@@ -905,11 +967,48 @@ export const downloadRecording = async (sessionId: string): Promise<void> => {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `recording-${new Date().toISOString().split("T")[0]}.mp4`;
+  const suffix = nodeId ? `-${nodeId}` : "";
+  link.download = `recording${suffix}-${new Date().toISOString().split("T")[0]}.mp4`;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+};
+
+export const startRecording = async (
+  sessionId: string,
+  nodeId?: string
+): Promise<{ status: string }> => {
+  const params = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  const response = await fetch(
+    `/api/v1/recordings/${sessionId}/start${params}`,
+    {
+      method: "POST",
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Start recording failed: ${response.status}: ${errorText}`);
+  }
+  return response.json();
+};
+
+export const stopRecording = async (
+  sessionId: string,
+  nodeId?: string
+): Promise<{ status: string }> => {
+  const params = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  const response = await fetch(
+    `/api/v1/recordings/${sessionId}/stop${params}`,
+    {
+      method: "POST",
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Stop recording failed: ${response.status}: ${errorText}`);
+  }
+  return response.json();
 };
 
 // ---------------------------------------------------------------------------

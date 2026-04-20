@@ -356,6 +356,10 @@ interface SettingsPanelProps {
   ) => void;
   isCloudMode?: boolean;
   onOpenLoRAsSettings?: () => void;
+  /** When true, the graph is non-linear so pipeline controls should be disabled */
+  nonLinearGraph?: boolean;
+  /** Callback to clear the graph and return to Perform Mode controls */
+  onClearGraph?: () => void;
 }
 
 export function SettingsPanel({
@@ -404,6 +408,8 @@ export function SettingsPanel({
   onPostprocessorSchemaFieldOverrideChange,
   isCloudMode = false,
   onOpenLoRAsSettings,
+  nonLinearGraph = false,
+  onClearGraph,
 }: SettingsPanelProps) {
   // Local slider state management hooks
   const noiseScaleSlider = useLocalSliderValue(noiseScale, onNoiseScaleChange);
@@ -495,12 +501,28 @@ export function SettingsPanel({
         <CardTitle className="text-base font-medium">Settings</CardTitle>
       </CardHeader>
       <CardContent className="space-y-6 overflow-y-auto flex-1 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:transition-colors [&::-webkit-scrollbar-thumb:hover]:bg-gray-400">
+        {nonLinearGraph && (
+          <div className="space-y-2">
+            <p className="text-xs text-amber-400/80 italic">
+              Settings are managed in Workflow Builder. Clear the graph to use
+              Perform Mode.
+            </p>
+            {onClearGraph && (
+              <button
+                onClick={onClearGraph}
+                className="text-xs px-3 py-1.5 rounded bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 transition-colors"
+              >
+                Clear Graph
+              </button>
+            )}
+          </div>
+        )}
         <div className="space-y-2">
           <h3 className="text-sm font-medium">Pipeline ID</h3>
           <Select
             value={pipelineId}
             onValueChange={handlePipelineIdChange}
-            disabled={isStreaming || isLoading}
+            disabled={isStreaming || isLoading || nonLinearGraph}
           >
             <SelectTrigger className="w-full">
               <SelectValue placeholder="Select a pipeline" />
@@ -650,7 +672,7 @@ export function SettingsPanel({
           onOverrideChange={onPreprocessorSchemaFieldOverrideChange}
           inputMode={inputMode}
           isStreaming={isStreaming}
-          isLoading={isLoading}
+          isLoading={isLoading || nonLinearGraph}
         />
 
         {/* Postprocessor List */}
@@ -672,7 +694,7 @@ export function SettingsPanel({
           onOverrideChange={onPostprocessorSchemaFieldOverrideChange}
           inputMode={inputMode}
           isStreaming={isStreaming}
-          isLoading={isLoading}
+          isLoading={isLoading || nonLinearGraph}
         />
 
         {/* Schema-driven configuration (when configSchema has ui.category===configuration) or legacy */}
@@ -867,9 +889,9 @@ export function SettingsPanel({
                               onValueChange={
                                 vaceContextScaleSlider.handleValueChange
                               }
-                              onValueCommit={
-                                vaceContextScaleSlider.handleValueCommit
-                              }
+                              onValueCommit={v => {
+                                vaceContextScaleSlider.handleValueCommit(v);
+                              }}
                               min={0}
                               max={2}
                               step={0.1}
@@ -1041,9 +1063,9 @@ export function SettingsPanel({
                           onValueChange={
                             kvCacheAttentionBiasSlider.handleValueChange
                           }
-                          onValueCommit={
-                            kvCacheAttentionBiasSlider.handleValueCommit
-                          }
+                          onValueCommit={v => {
+                            kvCacheAttentionBiasSlider.handleValueCommit(v);
+                          }}
                           min={0.01}
                           max={1.0}
                           step={0.01}
@@ -1157,7 +1179,9 @@ export function SettingsPanel({
                         tooltip={PARAMETER_METADATA.noiseScale.tooltip}
                         value={noiseScaleSlider.localValue}
                         onValueChange={noiseScaleSlider.handleValueChange}
-                        onValueCommit={noiseScaleSlider.handleValueCommit}
+                        onValueCommit={v => {
+                          noiseScaleSlider.handleValueCommit(v);
+                        }}
                         min={0.0}
                         max={1.0}
                         step={0.01}

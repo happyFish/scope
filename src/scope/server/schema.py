@@ -542,6 +542,14 @@ class PipelineStatusResponse(BaseModel):
         default=None,
         description="Current loading substage (e.g., 'Loading diffusion model...')",
     )
+    produces_video: bool = Field(
+        default=True,
+        description="Whether the loaded pipeline chain produces video output",
+    )
+    produces_audio: bool = Field(
+        default=False,
+        description="Whether the loaded pipeline chain produces audio output",
+    )
 
 
 class PipelineSchemasResponse(BaseModel):
@@ -617,6 +625,10 @@ class PluginInfo(BaseModel):
     package_spec: str | None = Field(
         default=None,
         description="Package specifier for upgrades (git URL for git packages, name for PyPI)",
+    )
+    bundled: bool = Field(
+        default=False,
+        description="Whether this plugin is bundled and cannot be uninstalled",
     )
 
 

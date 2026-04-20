@@ -1,11 +1,12 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import {
-  CheckCircle2,
-  XCircle,
   AlertTriangle,
   Download,
   Upload,
   Loader2,
+  ExternalLink,
+  Save,
+  KeyRound,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
@@ -28,13 +29,15 @@ import {
   AlertDialogTitle,
 } from "./ui/alert-dialog";
 import { toast } from "sonner";
-import type {
-  ScopeWorkflow,
-  ResolutionItem,
-  WorkflowResolutionPlan,
-  WorkflowLoRAProvenance,
-} from "../lib/workflowApi";
-import { resolveWorkflow } from "../lib/api";
+import type { ScopeWorkflow, WorkflowResolutionPlan } from "../lib/workflowApi";
+import { resolveWorkflow, getApiKeys, setApiKey } from "../lib/api";
+import type { ApiKeyInfo } from "../lib/api";
+import {
+  statusIcon,
+  kindLabel,
+  findLoRAProvenance,
+  LoRAProvenanceLabel,
+} from "./workflowDialogHelpers";
 import { useLoRAsContext } from "../contexts/LoRAsContext";
 import { usePipelinesContext } from "../contexts/PipelinesContext";
 import { usePluginsContext } from "../contexts/PluginsContext";
@@ -44,6 +47,7 @@ import {
   workflowToSettings,
   workflowTimelineToPrompts,
   workflowToPromptState,
+  extractFilename,
 } from "../lib/workflowSettings";
 import type { WorkflowPromptState } from "../lib/workflowSettings";
 import {
@@ -51,6 +55,7 @@ import {
   usePluginInstalls,
 } from "../hooks/useWorkflowDependencies";
 import { DependencyStatusIndicator } from "./DependencyStatusIndicator";
+import { trackEvent } from "../lib/analytics";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,75 +71,11 @@ interface WorkflowImportDialogProps {
     timelinePrompts: TimelinePrompt[],
     promptState: WorkflowPromptState | null
   ) => void;
+  /** When set, the dialog calls this instead of onLoad (used for graph-mode import). */
+  onLoadToGraph?: (workflow: ScopeWorkflow) => void;
   initialWorkflow?: ScopeWorkflow | null;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-const statusIcon = (status: ResolutionItem["status"]) => {
-  switch (status) {
-    case "ok":
-      return <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />;
-    case "missing":
-      return <XCircle className="h-4 w-4 text-red-500 shrink-0" />;
-    case "version_mismatch":
-      return <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />;
-  }
-};
-
-const kindLabel = (kind: ResolutionItem["kind"]) => {
-  switch (kind) {
-    case "pipeline":
-      return "Pipeline";
-    case "plugin":
-      return "Plugin";
-    case "lora":
-      return "LoRA";
-  }
-};
-
-function provenanceLabel(prov: WorkflowLoRAProvenance): string {
-  if (prov.source === "huggingface" && prov.repo_id) {
-    return `HuggingFace: ${prov.repo_id}`;
-  }
-  if (prov.source === "civitai") {
-    return `CivitAI model ${prov.model_id ?? prov.version_id ?? ""}`;
-  }
-  if (prov.source === "url" && prov.url) {
-    return prov.url;
-  }
-  return prov.source;
-}
-
-function findLoRAProvenance(
-  workflow: ScopeWorkflow,
-  filename: string
-): WorkflowLoRAProvenance | null {
-  const lora = workflow.pipelines
-    .flatMap(p => p.loras)
-    .find(l => l.filename === filename);
-  if (lora?.provenance && lora.provenance.source !== "local") {
-    return lora.provenance;
-  }
-  return null;
-}
-
-function LoRAProvenanceLabel({
-  workflow,
-  filename,
-}: {
-  workflow: ScopeWorkflow;
-  filename: string;
-}) {
-  const prov = findLoRAProvenance(workflow, filename);
-  if (!prov) return null;
-  return (
-    <p className="text-[10px] text-muted-foreground mt-0.5">
-      {provenanceLabel(prov)}
-    </p>
-  );
+  /** When true, API key warnings for LoRA downloads are hidden (cloud handles auth). */
+  cloudConnected?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +86,9 @@ export function WorkflowImportDialog({
   open,
   onClose,
   onLoad,
+  onLoadToGraph,
   initialWorkflow,
+  cloudConnected = false,
 }: WorkflowImportDialogProps) {
   const [step, setStep] = useState<ImportStep>("select");
   const [workflow, setWorkflow] = useState<ScopeWorkflow | null>(null);
@@ -169,6 +112,7 @@ export function WorkflowImportDialog({
   }, [workflow, refreshPipelines, refreshLoRAs, refreshPlugins]);
 
   const loras = useLoRADownloads(workflow, reResolveWorkflow);
+  const { reset: resetLoras, initialize: initializeLoras } = loras;
 
   // -- Confirm dialog state (shared for load & plugin-install confirms) -----
   const [confirmState, setConfirmState] = useState<{
@@ -199,7 +143,7 @@ export function WorkflowImportDialog({
   const confirmPluginInstall = useCallback(
     (installSpec: string) =>
       showConfirm(
-        "Install Plugin",
+        "Install Node",
         `This will install the package "${installSpec}" via pip. Only proceed if you trust the workflow source.`
       ),
     [showConfirm]
@@ -210,17 +154,97 @@ export function WorkflowImportDialog({
     reResolveWorkflow,
     confirmPluginInstall
   );
+  const { reset: resetPlugins, initialize: initializePlugins } = plugins;
+
+  // -- API key warning state -------------------------------------------------
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
+  const [keyInputValues, setKeyInputValues] = useState<Record<string, string>>(
+    {}
+  );
+  const [savingKeyIds, setSavingKeyIds] = useState<Set<string>>(new Set());
+
+  const fetchApiKeys = useCallback(async () => {
+    try {
+      const response = await getApiKeys();
+      setApiKeys(response.keys);
+    } catch {
+      // Non-critical — warning just won't show
+    }
+  }, []);
+
+  // Fetch API keys when entering review step (skip for cloud — cloud handles auth)
+  useEffect(() => {
+    if (step === "review" && !cloudConnected) {
+      fetchApiKeys();
+    }
+  }, [step, fetchApiKeys, cloudConnected]);
+
+  // Services that need a key: missing LoRAs hosted on a service without a key.
+  // On cloud inference the server manages credentials, so skip the warning.
+  const missingKeyServices = useMemo(() => {
+    if (cloudConnected) return [];
+    if (!plan || !workflow || apiKeys.length === 0) return [];
+    const neededSources = new Set<string>();
+    for (const item of plan.items) {
+      if (
+        item.kind !== "lora" ||
+        item.status !== "missing" ||
+        !item.can_auto_resolve
+      )
+        continue;
+      const prov = findLoRAProvenance(workflow, item.name);
+      if (prov?.source === "huggingface" || prov?.source === "civitai") {
+        neededSources.add(prov.source);
+      }
+    }
+    return apiKeys.filter(k => neededSources.has(k.id) && !k.is_set);
+  }, [cloudConnected, plan, workflow, apiKeys]);
+
+  const handleSaveApiKey = useCallback(
+    async (keyInfo: ApiKeyInfo) => {
+      const value = keyInputValues[keyInfo.id];
+      if (!value?.trim()) return;
+
+      setSavingKeyIds(prev => new Set(prev).add(keyInfo.id));
+      try {
+        const response = await setApiKey(keyInfo.id, value.trim());
+        if (response.success) {
+          toast.success(`${keyInfo.name} API key saved`);
+          setKeyInputValues(prev => {
+            const next = { ...prev };
+            delete next[keyInfo.id];
+            return next;
+          });
+          await fetchApiKeys();
+        }
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to save API key"
+        );
+      } finally {
+        setSavingKeyIds(prev => {
+          const next = new Set(prev);
+          next.delete(keyInfo.id);
+          return next;
+        });
+      }
+    },
+    [keyInputValues, fetchApiKeys]
+  );
 
   // Reset all state when dialog closes
   const handleClose = useCallback(() => {
     setStep("select");
     setWorkflow(null);
     setPlan(null);
-    loras.reset();
-    plugins.reset();
+    resetLoras();
+    resetPlugins();
+    setApiKeys([]);
+    setKeyInputValues({});
+    setSavingKeyIds(new Set());
     setValidating(false);
     onClose();
-  }, [onClose, loras.reset, plugins.reset]);
+  }, [onClose, resetLoras, resetPlugins]);
 
   // -----------------------------------------------------------------------
   // Auto-resolve when opened with a preloaded workflow (e.g. from deeplink)
@@ -237,14 +261,24 @@ export function WorkflowImportDialog({
 
         const resolution = await resolveWorkflow(initialWorkflow);
         if (cancelled) return;
+
+        // If all dependencies are already resolved, skip the review dialog
+        if (
+          resolution.items.every(i => i.status === "ok") &&
+          resolution.warnings.length === 0
+        ) {
+          await loadWorkflowDirect(initialWorkflow);
+          return;
+        }
+
         setPlan(resolution);
 
-        loras.initialize(
+        initializeLoras(
           resolution.items
             .filter(i => i.kind === "lora" && i.status === "missing")
             .map(i => i.name)
         );
-        plugins.initialize(
+        initializePlugins(
           resolution.items
             .filter(
               i =>
@@ -274,6 +308,88 @@ export function WorkflowImportDialog({
     // Only re-run when the dialog opens with a new initialWorkflow reference
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialWorkflow]);
+
+  // -----------------------------------------------------------------------
+  // Load workflow into the interface
+  // -----------------------------------------------------------------------
+
+  /** Load a workflow directly (no confirmation dialog). */
+  const loadWorkflowDirect = useCallback(
+    async (wf: ScopeWorkflow) => {
+      if (onLoadToGraph) {
+        const freshLoraFiles = await refreshLoRAs();
+        const patchedWorkflow = {
+          ...wf,
+          pipelines: wf.pipelines.map(p => ({
+            ...p,
+            loras: p.loras.map(l => {
+              const resolved = freshLoraFiles.find(
+                f =>
+                  extractFilename(f.path).toLowerCase() ===
+                  l.filename.toLowerCase()
+              );
+              return resolved ? { ...l, filename: resolved.path } : l;
+            }),
+          })),
+        };
+        onLoadToGraph(patchedWorkflow);
+        trackEvent("workflow_imported", {
+          node_count: wf.graph?.nodes?.length ?? wf.pipelines.length,
+          source: "file",
+          surface: "app_chrome",
+        });
+        toast.success("Workflow loaded into graph", {
+          description: `"${wf.metadata.name}" loaded into the graph editor`,
+        });
+        handleClose();
+        return;
+      }
+
+      // Fetch fresh LoRA files to avoid stale closure after downloads
+      const freshLoraFiles = await refreshLoRAs();
+      const importedSettings = workflowToSettings(wf, freshLoraFiles);
+      const timelinePrompts = workflowTimelineToPrompts(wf.timeline);
+      const promptState = workflowToPromptState(wf);
+
+      // Persist the workflow's graph to localStorage so the graph editor can
+      // pick it up when refreshGraph() is called after import.
+      if (wf.graph?.nodes && wf.graph?.edges) {
+        try {
+          localStorage.setItem("scope:graph:backup", JSON.stringify(wf.graph));
+        } catch {
+          /* ignore */
+        }
+      }
+
+      onLoad(importedSettings, timelinePrompts, promptState);
+      trackEvent("workflow_imported", {
+        node_count: wf.graph?.nodes?.length ?? wf.pipelines.length,
+        source: "file",
+        surface: "app_chrome",
+      });
+      toast.success("Workflow loaded", {
+        description: `"${wf.metadata.name}" loaded into the interface`,
+      });
+      handleClose();
+    },
+    [onLoad, onLoadToGraph, handleClose, refreshLoRAs]
+  );
+
+  const handleLoad = useCallback(async () => {
+    if (!workflow) return;
+
+    const confirmed = await showConfirm(
+      "Load Workflow",
+      "Loading this workflow will replace your current settings and timeline. Continue?"
+    );
+    if (!confirmed) return;
+
+    // Close the dialog immediately so the user doesn't see the review
+    // content flash back while the async load is in progress.
+    const wf = workflow;
+    handleClose();
+    await loadWorkflowDirect(wf);
+  }, [workflow, showConfirm, loadWorkflowDirect, handleClose]);
 
   // -----------------------------------------------------------------------
   // File selection and validation
@@ -314,15 +430,25 @@ export function WorkflowImportDialog({
         setWorkflow(parsed);
 
         const resolution = await resolveWorkflow(parsed);
+
+        // If all dependencies are already resolved, skip the review dialog
+        if (
+          resolution.items.every(i => i.status === "ok") &&
+          resolution.warnings.length === 0
+        ) {
+          await loadWorkflowDirect(parsed);
+          return;
+        }
+
         setPlan(resolution);
 
         // Initialize dependency states from resolution items
-        loras.initialize(
+        initializeLoras(
           resolution.items
             .filter(i => i.kind === "lora" && i.status === "missing")
             .map(i => i.name)
         );
-        plugins.initialize(
+        initializePlugins(
           resolution.items
             .filter(
               i =>
@@ -343,7 +469,7 @@ export function WorkflowImportDialog({
         setValidating(false);
       }
     },
-    [loras.initialize, plugins.initialize]
+    [initializeLoras, initializePlugins, loadWorkflowDirect]
   );
 
   const handleDrop = useCallback(
@@ -364,32 +490,6 @@ export function WorkflowImportDialog({
     },
     [handleFileSelect]
   );
-
-  // -----------------------------------------------------------------------
-  // Load workflow into the interface
-  // -----------------------------------------------------------------------
-
-  const handleLoad = useCallback(async () => {
-    if (!workflow) return;
-
-    const confirmed = await showConfirm(
-      "Load Workflow",
-      "Loading this workflow will replace your current settings and timeline. Continue?"
-    );
-    if (!confirmed) return;
-
-    // Fetch fresh LoRA files to avoid stale closure after downloads
-    const freshLoraFiles = await refreshLoRAs();
-    const importedSettings = workflowToSettings(workflow, freshLoraFiles);
-    const timelinePrompts = workflowTimelineToPrompts(workflow.timeline);
-    const promptState = workflowToPromptState(workflow);
-
-    onLoad(importedSettings, timelinePrompts, promptState);
-    toast.success("Workflow loaded", {
-      description: `"${workflow.metadata.name}" loaded into the interface`,
-    });
-    handleClose();
-  }, [workflow, onLoad, handleClose, showConfirm, refreshLoRAs]);
 
   // -----------------------------------------------------------------------
   // Derived state
@@ -474,6 +574,67 @@ export function WorkflowImportDialog({
                 {new Date(workflow.metadata.created_at).toLocaleDateString()}
               </p>
             </div>
+
+            {/* API key warning */}
+            {missingKeyServices.length > 0 && (
+              <div className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 space-y-2.5">
+                <div className="flex items-start gap-2">
+                  <KeyRound className="h-4 w-4 text-amber-500 mt-0.5 shrink-0" />
+                  <p className="text-xs text-amber-500">
+                    {missingKeyServices.length === 1
+                      ? `A ${missingKeyServices[0].name} API key is required to download some LoRAs in this workflow.`
+                      : "API keys are required to download some LoRAs in this workflow."}
+                  </p>
+                </div>
+                {missingKeyServices.map(keyInfo => (
+                  <div key={keyInfo.id} className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-foreground shrink-0 w-24">
+                      {keyInfo.name}
+                    </span>
+                    <input
+                      type="password"
+                      placeholder="Paste API key..."
+                      value={keyInputValues[keyInfo.id] ?? ""}
+                      onChange={e =>
+                        setKeyInputValues(prev => ({
+                          ...prev,
+                          [keyInfo.id]: e.target.value,
+                        }))
+                      }
+                      className="flex-1 min-w-0 h-7 rounded-md border border-input bg-background px-2 text-xs placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-xs gap-1"
+                      disabled={
+                        !keyInputValues[keyInfo.id]?.trim() ||
+                        savingKeyIds.has(keyInfo.id)
+                      }
+                      onClick={() => handleSaveApiKey(keyInfo)}
+                    >
+                      {savingKeyIds.has(keyInfo.id) ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Save className="h-3 w-3" />
+                      )}
+                      Save
+                    </Button>
+                    {keyInfo.key_url && (
+                      <a
+                        href={keyInfo.key_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-amber-500 hover:text-amber-400 shrink-0 flex items-center gap-0.5"
+                      >
+                        Get key
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* Resolution items */}
             <div className="space-y-2">
@@ -571,7 +732,7 @@ export function WorkflowImportDialog({
                   <Download className="h-4 w-4 mr-2" />
                   {plugins.someInstalling
                     ? "Installing..."
-                    : `Install All Missing Plugins (${installablePlugins.filter(p => plugins.installs[p.name] !== "done").length})`}
+                    : `Install All Missing Nodes (${installablePlugins.filter(p => plugins.installs[p.name] !== "done").length})`}
                 </Button>
               )}
 
@@ -614,7 +775,7 @@ export function WorkflowImportDialog({
       {/* Confirmation alert dialog (replaces window.confirm) */}
       <AlertDialog
         open={confirmState !== null}
-        onOpenChange={open => {
+        onOpenChange={(open: boolean) => {
           if (!open) handleConfirmCancel();
         }}
       >

@@ -11,7 +11,7 @@ import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
 import { Switch } from "./ui/switch";
 import { Badge } from "./ui/badge";
 import { Input } from "./ui/input";
-import { Upload, ArrowUp, RefreshCw } from "lucide-react";
+import { Upload, ArrowUp, RefreshCw, ArrowLeftRight } from "lucide-react";
 import { LabelWithTooltip } from "./ui/label-with-tooltip";
 import type { VideoSourceMode } from "../hooks/useVideoSource";
 import type {
@@ -24,6 +24,7 @@ import type { ExtensionMode, InputMode, PipelineInfo } from "../types";
 import { PromptInput } from "./PromptInput";
 import { TimelinePromptEditor } from "./TimelinePromptEditor";
 import type { TimelinePrompt } from "./PromptTimeline";
+import { AudioManager } from "./AudioManager";
 import { ImageManager } from "./ImageManager";
 import { Button } from "./ui/button";
 import {
@@ -34,7 +35,6 @@ import {
 } from "../lib/schemaSettings";
 import { SchemaPrimitiveField } from "./PrimitiveFields";
 import { useCloudStatus } from "../hooks/useCloudStatus";
-
 interface InputAndControlsPanelProps {
   className?: string;
   pipelines: Record<string, PipelineInfo> | null;
@@ -50,6 +50,7 @@ interface InputAndControlsPanelProps {
   onStartStream: () => void;
   onStopStream: () => void;
   onVideoFileUpload?: (file: File) => Promise<boolean>;
+  onCycleSampleVideo?: () => void;
   pipelineId: string;
   prompts: PromptItem[];
   onPromptsChange: (prompts: PromptItem[]) => void;
@@ -87,6 +88,8 @@ interface InputAndControlsPanelProps {
   // Currently selected Syphon source identifier
   selectedSyphonSource?: string;
   onSyphonSourceChange?: (identifier: string) => void;
+  syphonFlipVertical?: boolean;
+  onSyphonFlipVerticalChange?: (enabled: boolean) => void;
   // VACE reference images (only shown when VACE is enabled)
   vaceEnabled?: boolean;
   refImages?: string[];
@@ -128,6 +131,7 @@ export function InputAndControlsPanel({
   onStartStream: _onStartStream,
   onStopStream: _onStopStream,
   onVideoFileUpload,
+  onCycleSampleVideo,
   pipelineId,
   prompts,
   onPromptsChange,
@@ -158,6 +162,8 @@ export function InputAndControlsPanel({
   onNdiSourceChange,
   selectedSyphonSource = "",
   onSyphonSourceChange,
+  syphonFlipVertical = false,
+  onSyphonFlipVerticalChange,
   vaceEnabled = true,
   refImages = [],
   onRefImagesChange,
@@ -226,7 +232,9 @@ export function InputAndControlsPanel({
   // Use higher FPS for Syphon since it's local GPU sharing with minimal overhead
   const syphonStreamUrl =
     mode === "syphon" && selectedSyphonSource
-      ? getInputSourceStreamUrl("syphon", selectedSyphonSource, 15)
+      ? getInputSourceStreamUrl("syphon", selectedSyphonSource, 15, {
+          flipVertical: syphonFlipVertical,
+        })
       : null;
   const [isSyphonStreamLoaded, setIsSyphonStreamLoaded] = useState(false);
 
@@ -572,6 +580,21 @@ export function InputAndControlsPanel({
                     )}
                   </div>
                 )}
+                <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
+                  <div className="min-w-0">
+                    <div className="text-sm">Flip Vertical</div>
+                    <div className="text-xs text-muted-foreground">
+                      Compensate for Syphon senders that arrive upside down.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={syphonFlipVertical}
+                    onCheckedChange={checked =>
+                      onSyphonFlipVerticalChange?.(checked)
+                    }
+                    disabled={mode !== "syphon" || isStreaming}
+                  />
+                </div>
               </div>
             ) : (
               /* Video/Camera Input Preview */
@@ -605,28 +628,48 @@ export function InputAndControlsPanel({
                   </div>
                 )}
 
-                {/* Upload button - only show in video mode */}
-                {mode === "video" && onVideoFileUpload && (
-                  <>
-                    <input
-                      type="file"
-                      accept="video/*"
-                      onChange={handleFileUpload}
-                      className="hidden"
-                      id="video-upload"
-                      disabled={isStreaming || isConnecting}
-                    />
-                    <label
-                      htmlFor="video-upload"
-                      className={`absolute bottom-2 right-2 p-2 rounded-full bg-black/50 transition-colors ${
-                        isStreaming || isConnecting
-                          ? "opacity-50 cursor-not-allowed"
-                          : "hover:bg-black/70 cursor-pointer"
-                      }`}
-                    >
-                      <Upload className="h-4 w-4 text-white" />
-                    </label>
-                  </>
+                {/* Video file buttons - only show in video mode */}
+                {mode === "video" && (
+                  <div className="absolute bottom-2 right-2 flex gap-1.5">
+                    {onCycleSampleVideo && (
+                      <button
+                        type="button"
+                        onClick={onCycleSampleVideo}
+                        disabled={isStreaming || isConnecting}
+                        className={`p-2 rounded-full bg-black/50 transition-colors ${
+                          isStreaming || isConnecting
+                            ? "opacity-50 cursor-not-allowed"
+                            : "hover:bg-black/70 cursor-pointer"
+                        }`}
+                        title="Cycle sample video"
+                      >
+                        <ArrowLeftRight className="h-4 w-4 text-white" />
+                      </button>
+                    )}
+                    {onVideoFileUpload && (
+                      <>
+                        <input
+                          type="file"
+                          accept="video/*"
+                          onChange={handleFileUpload}
+                          className="hidden"
+                          id="video-upload"
+                          disabled={isStreaming || isConnecting}
+                        />
+                        <label
+                          htmlFor="video-upload"
+                          className={`p-2 rounded-full bg-black/50 transition-colors ${
+                            isStreaming || isConnecting
+                              ? "opacity-50 cursor-not-allowed"
+                              : "hover:bg-black/70 cursor-pointer"
+                          }`}
+                          title="Upload video file"
+                        >
+                          <Upload className="h-4 w-4 text-white" />
+                        </label>
+                      </>
+                    )}
+                  </div>
                 )}
               </div>
             )}
@@ -896,6 +939,30 @@ export function InputAndControlsPanel({
                           disabled={disabled}
                           maxImages={1}
                           hideLabel
+                        />
+                      </div>
+                    );
+                  }
+                  if (comp === "audio") {
+                    const path = value == null ? null : String(value);
+                    return (
+                      <div key={key} className="space-y-1">
+                        {ui.label != null && (
+                          <span className="text-xs text-muted-foreground">
+                            {ui.label}
+                          </span>
+                        )}
+                        <AudioManager
+                          audioPath={path}
+                          onAudioChange={p =>
+                            onSchemaFieldOverrideChange?.(
+                              key,
+                              p,
+                              isRuntimeParam
+                            )
+                          }
+                          disabled={disabled}
+                          label={ui.label ?? "Audio Input"}
                         />
                       </div>
                     );

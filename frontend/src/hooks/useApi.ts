@@ -136,10 +136,22 @@ export function useApi() {
 
   // Recording - note: in cloud mode, we still use direct HTTP for binary download
   const downloadRecording = useCallback(
-    async (sessionId: string): Promise<void> => {
-      // Always use direct HTTP for binary downloads
-      // In cloud mode, this may need the full URL
-      return api.downloadRecording(sessionId);
+    async (sessionId: string, nodeId?: string): Promise<void> => {
+      return api.downloadRecording(sessionId, nodeId);
+    },
+    []
+  );
+
+  const startRecording = useCallback(
+    async (sessionId: string, nodeId?: string): Promise<{ status: string }> => {
+      return api.startRecording(sessionId, nodeId);
+    },
+    []
+  );
+
+  const stopRecording = useCallback(
+    async (sessionId: string, nodeId?: string): Promise<{ status: string }> => {
+      return api.stopRecording(sessionId, nodeId);
     },
     []
   );
@@ -216,6 +228,8 @@ export function useApi() {
 
     // Recording
     downloadRecording,
+    startRecording,
+    stopRecording,
 
     // WebRTC signaling
     getIceServers,

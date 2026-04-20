@@ -34,10 +34,12 @@ from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from .cloud_connection import CloudConnectionManager
+    from .livepeer import LivepeerConnection
     from .pipeline_manager import PipelineManager
     from .schema import PluginInfo
     from .webrtc import WebRTCManager
 
+from scope.core.config import get_base_dir
 from scope.core.lora.manifest import (
     LoRAManifestEntry,
     LoRAProvenance,
@@ -62,6 +64,7 @@ from .cloud_proxy import (
 from .download_models import download_models
 from .download_progress_manager import download_progress_manager
 from .file_utils import (
+    AUDIO_EXTENSIONS,
     IMAGE_EXTENSIONS,
     LORA_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -72,6 +75,7 @@ from .kafka_publisher import (
     is_kafka_enabled,
     set_kafka_publisher,
 )
+from .livepeer import is_livepeer_enabled
 from .logs_config import (
     LOG_FORMAT,
     FalConnectionFilter,
@@ -89,10 +93,12 @@ from .models_config import (
     ensure_models_dir,
     get_assets_dir,
     get_lora_dir,
+    get_shared_lora_dir,
     models_are_downloaded,
 )
 from .pipeline_manager import PipelineManager
 from .recording import (
+    RecordingManager,
     cleanup_recording_files,
     cleanup_temp_file,
 )
@@ -117,6 +123,7 @@ from .schema import (
     WebRTCOfferRequest,
     WebRTCOfferResponse,
 )
+from .scope_cloud_types import ScopeCloudBackend
 from .tempo_router import router as tempo_router
 
 # Cached responses for pipeline schemas and plugin list.
@@ -130,6 +137,14 @@ def _invalidate_plugin_caches():
     global _pipeline_schemas_cache, _plugins_list_cache
     _pipeline_schemas_cache = None
     _plugins_list_cache = None
+
+    # Also clear the plugin manager's per-plugin update check TTL cache
+    try:
+        from scope.core.plugins import get_plugin_manager
+
+        get_plugin_manager().clear_update_check_cache()
+    except Exception:
+        pass
 
 
 class STUNErrorFilter(logging.Filter):
@@ -194,6 +209,16 @@ def _configure_logging():
         logging.getLogger("uvicorn.access").setLevel(logging.INFO)
         logging.getLogger("fastapi").setLevel(logging.INFO)
     logging.getLogger("aiortc").setLevel(logging.INFO)
+
+    if os.getenv("LIVEPEER_DEBUG"):
+        logging.getLogger("livepeer_gateway").setLevel(logging.DEBUG)
+        logging.getLogger("scope.server.livepeer").setLevel(logging.DEBUG)
+        logging.getLogger("scope.server.livepeer_client").setLevel(logging.DEBUG)
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(
+                handler, RotatingFileHandler
+            ):
+                handler.setLevel(logging.DEBUG)
 
 
 # Set INFO for the cloud log re-emitter so cloud lines reach console and file
@@ -295,6 +320,8 @@ pipeline_manager = None
 server_start_time = time.time()
 # Global cloud connection manager instance
 cloud_connection_manager = None
+# Global Livepeer manager instance
+livepeer = None
 # Global Kafka publisher instance (optional, initialized if credentials are present)
 kafka_publisher = None
 # Global tempo sync manager instance
@@ -316,6 +343,19 @@ async def prewarm_pipeline(pipeline_id: str):
         logger.error(f"Error pre-warming pipeline {pipeline_id} in background: {e}")
 
 
+async def _prewarm_plugin_update_cache():
+    """Background task to warm the plugin update check cache at startup."""
+    try:
+        from scope.core.plugins import get_plugin_manager
+
+        pm = get_plugin_manager()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, pm.list_plugins_sync)
+        logger.info("Plugin update check cache warmed")
+    except Exception as e:
+        logger.debug(f"Plugin update cache warm-up skipped: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler for startup and shutdown events."""
@@ -323,6 +363,7 @@ async def lifespan(app: FastAPI):
     import torch
 
     from .cloud_connection import CloudConnectionManager
+    from .livepeer import LivepeerConnection
     from .pipeline_manager import PipelineManager
     from .tempo_sync import TempoSync
     from .webrtc import WebRTCManager
@@ -333,6 +374,7 @@ async def lifespan(app: FastAPI):
         pipeline_manager, \
         cloud_connection_manager, \
         kafka_publisher, \
+        livepeer, \
         tempo_sync, \
         osc_server, \
         dmx_server
@@ -370,6 +412,10 @@ async def lifespan(app: FastAPI):
     if PIPELINE is not None:
         asyncio.create_task(prewarm_pipeline(PIPELINE))
 
+    # Pre-warm the plugin update check cache in the background so the first
+    # "Nodes" / resolve-workflow call doesn't block on PyPI lookups.
+    asyncio.create_task(_prewarm_plugin_update_cache())
+
     webrtc_manager = WebRTCManager()
     logger.info("WebRTC manager initialized")
 
@@ -378,6 +424,11 @@ async def lifespan(app: FastAPI):
 
     cloud_connection_manager = CloudConnectionManager()
     logger.info("Cloud connection manager initialized")
+
+    livepeer = LivepeerConnection()
+    if is_livepeer_enabled():
+        livepeer.configure()
+        logger.info("Livepeer configured")
 
     # Initialize Kafka publisher if credentials are configured
     if is_kafka_enabled():
@@ -462,6 +513,11 @@ async def lifespan(app: FastAPI):
         await tempo_sync.stop()
         logger.info("Tempo sync shutdown complete")
 
+    if livepeer and livepeer.is_connected:
+        logger.info("Shutting down Livepeer connection...")
+        await livepeer.disconnect()
+        logger.info("Livepeer connection shutdown complete")
+
     if kafka_publisher:
         logger.info("Shutting down Kafka publisher...")
         await kafka_publisher.stop()
@@ -488,6 +544,23 @@ def get_osc_server():
     """Dependency to get OSC server instance."""
 
     return osc_server
+
+
+def get_livepeer() -> "LivepeerConnection":
+    """Dependency to get Livepeer manager instance."""
+    return livepeer
+
+
+def get_scope_cloud() -> ScopeCloudBackend:
+    """Dependency to get the selected remote backend.
+
+    Returns the backend object regardless of connection state so callers can
+    inspect status, including connecting/error states.  Callers that need an
+    *active* connection must check cloud_manager.is_connected themselves.
+    """
+    if is_livepeer_enabled():
+        return livepeer
+    return cloud_connection_manager
 
 
 def get_dmx_server():
@@ -517,12 +590,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Local cloud WebSocket endpoint — enabled by SCOPE_CLOUD_WS=1
+if os.environ.get("SCOPE_CLOUD_WS") == "1":
+    from fastapi import WebSocket as _WebSocket
+
+    from scope.cloud.dev_app import cloud_ws_handler
+
+    @app.websocket("/ws")
+    async def cloud_ws(ws: _WebSocket):
+        await cloud_ws_handler(ws)
+
 
 @app.get("/health", response_model=HealthResponse)
 @cloud_proxy()
 async def health_check(
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Health check endpoint."""
     return HealthResponse(
@@ -565,7 +648,7 @@ async def delete_fal_connection_id():
 @cloud_proxy(timeout=30.0)
 async def restart_server(
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Restart the server process.
 
@@ -671,7 +754,7 @@ async def load_pipeline(
     request: PipelineLoadRequest,
     http_request: Request,
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Load one or more pipelines.
 
@@ -723,7 +806,7 @@ async def load_pipeline(
 async def get_pipeline_status(
     http_request: Request,
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Get current pipeline status.
 
@@ -744,7 +827,7 @@ async def get_pipeline_status(
 @cloud_proxy()
 async def get_pipeline_schemas(
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Get configuration schemas and defaults for all available pipelines.
 
@@ -1106,7 +1189,7 @@ async def handle_webrtc_offer(
     request: WebRTCOfferRequest,
     webrtc_manager: "WebRTCManager" = Depends(get_webrtc_manager),
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Handle WebRTC offer and return answer.
 
@@ -1208,20 +1291,33 @@ async def close_webrtc_session(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _session_has_graph_record_nodes(session) -> bool:
+    """True when the session uses graph record-node queues (per-node MP4)."""
+    fp = session.frame_processor
+    if fp is None:
+        return False
+    return bool(fp.sink_manager.recording.get_node_ids())
+
+
 @app.get("/api/v1/recordings/{session_id}")
-@cloud_proxy(recording_download_cloud_path, timeout=120.0)
 async def download_recording(
     http_request: Request,
     session_id: str,
     background_tasks: BackgroundTasks,
     webrtc_manager: "WebRTCManager" = Depends(get_webrtc_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
+    node_id: str | None = Query(
+        None,
+        description="Record node id for graph mode (per-node recording file)",
+    ),
 ):
     """Download the recording file for the specified session.
-    This will finalize the current recording and create a copy for download,
-    then continue recording with a new file.
 
-    In cloud mode, this proxies the download request to cloud.
+    Local-first: if the session has a local recording, serve it directly.
+    Falls back to cloud proxy only when there is no local recording and
+    cloud is connected (pure cloud mode where recording happens remotely).
+
+    When the graph has record nodes, pass ``node_id`` to download that node's file.
     """
     try:
         session = webrtc_manager.get_session(session_id)
@@ -1231,38 +1327,199 @@ async def download_recording(
                 detail=f"Session {session_id} not found",
             )
 
-        # Check if session has a recording manager
-        if not session.recording_manager:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Recording not available for session {session_id}",
+        if node_id:
+            if not _session_has_graph_record_nodes(session):
+                raise HTTPException(
+                    status_code=400,
+                    detail="This session has no graph record nodes; omit node_id.",
+                )
+            coord = session.frame_processor.sink_manager.recording
+            if node_id not in coord.get_node_ids():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown record node {node_id!r}",
+                )
+            download_file = await coord.download_recording(node_id)
+            if not download_file or not Path(download_file).exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Recording file not available",
+                )
+            background_tasks.add_task(cleanup_temp_file, download_file)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"recording-{node_id}-{timestamp}.mp4"
+            return FileResponse(
+                download_file,
+                media_type="video/mp4",
+                filename=filename,
             )
 
-        # Finalize the recording and get the download file
-        download_file = await session.recording_manager.finalize_and_get_recording()
-        if not download_file or not Path(download_file).exists():
+        if _session_has_graph_record_nodes(session):
             raise HTTPException(
-                status_code=404,
-                detail="Recording file not available",
+                status_code=400,
+                detail="This session uses graph record nodes; add ?node_id=<record node id>.",
             )
 
-        # Schedule cleanup of the temp file after download
-        background_tasks.add_task(cleanup_temp_file, download_file)
+        has_local_recording = session.recording_manager
 
-        # Generate filename with datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"recording-{timestamp}.mp4"
+        if has_local_recording:
+            download_file = await session.recording_manager.finalize_and_get_recording()
+            if not download_file or not Path(download_file).exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Recording file not available",
+                )
 
-        # Return the file for download
-        return FileResponse(
-            download_file,
-            media_type="video/mp4",
-            filename=filename,
+            background_tasks.add_task(cleanup_temp_file, download_file)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"recording-{timestamp}.mp4"
+
+            return FileResponse(
+                download_file,
+                media_type="video/mp4",
+                filename=filename,
+            )
+
+        if cloud_manager and cloud_manager.is_connected:
+            cloud_path = recording_download_cloud_path(http_request, cloud_manager)
+            return await proxy_with_body(
+                cloud_manager, "GET", cloud_path, timeout=120.0
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail="No recording available for this session",
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error downloading recording: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/v1/recordings/{session_id}/start")
+async def start_recording(
+    session_id: str,
+    webrtc_manager: "WebRTCManager" = Depends(get_webrtc_manager),
+    node_id: str | None = Query(
+        None,
+        description="Record node id for graph mode (per-node recording)",
+    ),
+):
+    """Start recording for the specified session.
+
+    Creates a RecordingManager if one does not already exist (session-level).
+    For graph record nodes, pass ``node_id`` to record that node's feed.
+    """
+    try:
+        session = webrtc_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(
+                status_code=404, detail=f"Session {session_id} not found"
+            )
+
+        if node_id:
+            if not _session_has_graph_record_nodes(session):
+                raise HTTPException(
+                    status_code=400,
+                    detail="This session has no graph record nodes; omit node_id.",
+                )
+            coord = session.frame_processor.sink_manager.recording
+            if node_id not in coord.get_node_ids():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown record node {node_id!r}",
+                )
+            fps = session.frame_processor.get_fps()
+            ok = await coord.start_recording(node_id, fps)
+            if not ok:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to start recording for record node {node_id!r}",
+                )
+            return {"status": "started"}
+
+        if _session_has_graph_record_nodes(session):
+            raise HTTPException(
+                status_code=400,
+                detail="This session uses graph record nodes; pass node_id=<record node id>.",
+            )
+
+        if not session.recording_manager:
+            if not session.video_track:
+                raise HTTPException(
+                    status_code=400, detail="Session has no video track"
+                )
+            rm = RecordingManager(video_track=session.video_track)
+            if session.relay:
+                rm.set_relay(session.relay)
+            session.recording_manager = rm
+
+        if session.recording_manager.is_recording_started:
+            return {"status": "already_recording"}
+
+        await session.recording_manager.start_recording()
+        return {"status": "started"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting recording for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/v1/recordings/{session_id}/stop")
+async def stop_recording(
+    session_id: str,
+    webrtc_manager: "WebRTCManager" = Depends(get_webrtc_manager),
+    node_id: str | None = Query(
+        None,
+        description="Record node id for graph mode (per-node recording)",
+    ),
+):
+    """Stop recording for the specified session without downloading."""
+    try:
+        session = webrtc_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(
+                status_code=404, detail=f"Session {session_id} not found"
+            )
+
+        if node_id:
+            if not _session_has_graph_record_nodes(session):
+                raise HTTPException(
+                    status_code=400,
+                    detail="This session has no graph record nodes; omit node_id.",
+                )
+            coord = session.frame_processor.sink_manager.recording
+            if node_id not in coord.get_node_ids():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown record node {node_id!r}",
+                )
+            ok = await coord.stop_recording(node_id)
+            return {"status": "stopped" if ok else "not_recording"}
+
+        if _session_has_graph_record_nodes(session):
+            raise HTTPException(
+                status_code=400,
+                detail="This session uses graph record nodes; pass node_id=<record node id>.",
+            )
+
+        if not session.recording_manager:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Recording not available for session {session_id}",
+            )
+        if not session.recording_manager.is_recording_started:
+            return {"status": "not_recording"}
+
+        await session.recording_manager.stop_recording()
+        return {"status": "stopped"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error stopping recording for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -1283,6 +1540,7 @@ class LoRAFileInfo(BaseModel):
     folder: str | None = None
     sha256: str | None = None
     provenance: LoRAProvenance | None = None
+    read_only: bool = False
 
 
 class LoRAFilesResponse(BaseModel):
@@ -1295,7 +1553,7 @@ class LoRAFilesResponse(BaseModel):
 @cloud_proxy()
 async def list_lora_files(
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """List available LoRA files in the models/lora directory and its subdirectories.
 
@@ -1330,6 +1588,26 @@ async def list_lora_files(
         for file_path in iter_files(lora_dir, LORA_EXTENSIONS):
             lora_files.append(process_lora_file(file_path, lora_dir, manifest.entries))
 
+        # Also include LoRAs from the shared (persistent) directory if set.
+        # This surfaces pre-cached sample LoRAs in cloud mode.
+        shared_dir = get_shared_lora_dir()
+        if shared_dir and shared_dir.is_dir():
+            shared_names = {f.stem for f in iter_files(shared_dir, LORA_EXTENSIONS)}
+            # Mark session-dir LoRAs as read_only if they also exist in
+            # the shared dir (i.e. they are sample/onboarding LoRAs).
+            for lf in lora_files:
+                if lf.name in shared_names:
+                    lf.read_only = True
+            seen = {lf.name for lf in lora_files}
+            shared_manifest = load_manifest(shared_dir)
+            for file_path in iter_files(shared_dir, LORA_EXTENSIONS):
+                if file_path.stem not in seen:
+                    info = process_lora_file(
+                        file_path, shared_dir, shared_manifest.entries
+                    )
+                    info.read_only = True
+                    lora_files.append(info)
+
         lora_files.sort(key=lambda x: (x.folder or "", x.name))
         return LoRAFilesResponse(lora_files=lora_files)
 
@@ -1355,7 +1633,7 @@ ALLOWED_LORA_HOSTS = {"civitai.com", "huggingface.co"}
 async def install_lora_file(
     request: LoRAInstallRequest,
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Install a LoRA file from a URL (e.g. HuggingFace, CivitAI).
 
@@ -1499,7 +1777,9 @@ async def install_lora_file(
             )
 
         lora_dir = get_lora_dir()
-        dest_path = lora_dir / filename
+        dest_path = (lora_dir / filename).resolve()
+        if not dest_path.is_relative_to(lora_dir.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid filename")
 
         if dest_path.exists():
             raise HTTPException(
@@ -1592,7 +1872,7 @@ class LoRADeleteResponse(BaseModel):
 async def delete_lora_file(
     name: str,
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Delete a LoRA file by name."""
     try:
@@ -1624,6 +1904,15 @@ async def delete_lora_file(
                 detail=f"LoRA file '{name}' not found",
             )
 
+        # In cloud mode, prevent deletion of sample/onboarding LoRAs that
+        # are cached in the shared persistent directory.
+        shared_dir = get_shared_lora_dir()
+        if shared_dir and (shared_dir / found_path.name).is_file():
+            raise HTTPException(
+                status_code=403,
+                detail=f"'{name}' is a sample LoRA and cannot be removed in cloud mode",
+            )
+
         # Delete the file
         found_path.unlink()
         logger.info(f"Deleted LoRA file: {found_path}")
@@ -1650,7 +1939,7 @@ async def delete_lora_file(
 @app.post("/api/v1/lora/download")
 async def download_lora_endpoint(
     request: LoRADownloadRequest,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ) -> LoRADownloadResult:
     """Download a LoRA from HuggingFace, CivitAI, or a direct URL.
 
@@ -1711,7 +2000,7 @@ async def tag_lora_provenance(
 async def resolve_workflow_endpoint(
     workflow: WorkflowRequest,
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Resolve workflow dependencies and return a resolution plan.
 
@@ -1724,8 +2013,9 @@ async def resolve_workflow_endpoint(
     try:
         plugin_manager = get_plugin_manager()
         lora_dir = get_lora_dir()
+        shared_lora_dir = get_shared_lora_dir()
 
-        return resolve_workflow(workflow, plugin_manager, lora_dir)
+        return resolve_workflow(workflow, plugin_manager, lora_dir, shared_lora_dir)
     except Exception as e:
         logger.error("Error resolving workflow: %s", e, exc_info=True)
         raise HTTPException(
@@ -1739,7 +2029,7 @@ async def resolve_workflow_endpoint(
 async def list_assets(
     http_request: Request,
     type: str | None = Query(None, description="Filter by asset type (image, video)"),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """List available asset files in the assets directory and its subdirectories.
 
@@ -1773,12 +2063,19 @@ async def list_assets(
             extensions = IMAGE_EXTENSIONS
         elif type == "video":
             extensions = VIDEO_EXTENSIONS
+        elif type == "audio":
+            extensions = AUDIO_EXTENSIONS
         else:
-            extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
         for file_path in iter_files(assets_dir, extensions):
             ext = file_path.suffix.lower()
-            asset_type = "image" if ext in IMAGE_EXTENSIONS else "video"
+            if ext in IMAGE_EXTENSIONS:
+                asset_type = "image"
+            elif ext in AUDIO_EXTENSIONS:
+                asset_type = "audio"
+            else:
+                asset_type = "video"
             asset_files.append(process_asset_file(file_path, assets_dir, asset_type))
 
         # Sort by created_at (most recent first), then by folder and name
@@ -1794,16 +2091,15 @@ async def list_assets(
 async def upload_asset(
     request: Request,
     filename: str = Query(...),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
-    """Upload an asset file (image or video) to the assets directory.
+    """Upload an asset file (image, video, or audio) to the assets directory.
 
     When cloud mode is active, the file is uploaded to the cloud server instead.
     """
 
     try:
-        # Validate file type - support both images and videos
-        allowed_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        allowed_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
         file_extension = Path(filename).suffix.lower()
         if file_extension not in allowed_extensions:
@@ -1812,7 +2108,6 @@ async def upload_asset(
                 detail=f"Invalid file type. Allowed types: {', '.join(allowed_extensions)}",
             )
 
-        # Determine asset type
         if file_extension in IMAGE_EXTENSIONS:
             asset_type = "image"
             content_type_map = {
@@ -1821,6 +2116,14 @@ async def upload_asset(
                 ".jpeg": "image/jpeg",
                 ".webp": "image/webp",
                 ".bmp": "image/bmp",
+            }
+        elif file_extension in AUDIO_EXTENSIONS:
+            asset_type = "audio"
+            content_type_map = {
+                ".wav": "audio/wav",
+                ".mp3": "audio/mpeg",
+                ".flac": "audio/flac",
+                ".ogg": "audio/ogg",
             }
         else:
             asset_type = "video"
@@ -1864,7 +2167,10 @@ async def upload_asset(
         assets_dir.mkdir(parents=True, exist_ok=True)
 
         # Save file to assets directory
-        file_path = assets_dir / filename
+        file_path = (assets_dir / filename).resolve()
+        if not file_path.is_relative_to(assets_dir.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(content)
 
         # Return file info matching AssetFileInfo structure
@@ -1956,7 +2262,7 @@ async def serve_asset(asset_path: str):
 async def get_model_status(
     http_request: Request,
     pipeline_id: str,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Check if models for a pipeline are downloaded and get download progress."""
     try:
@@ -1987,7 +2293,7 @@ async def get_model_status(
 async def download_pipeline_models(
     request: DownloadModelsRequest,
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Download models for a specific pipeline."""
     try:
@@ -2189,7 +2495,10 @@ def get_input_source_resolution(
 
 @app.get("/api/v1/input-sources/{source_type}/sources/{identifier:path}/stream")
 async def stream_input_source_preview(
-    source_type: str, identifier: str, fps: int = Query(2, ge=1, le=30)
+    source_type: str,
+    identifier: str,
+    fps: int = Query(2, ge=1, le=30),
+    flip_vertical: bool = Query(False),
 ):
     """MJPEG stream of an input source for live preview."""
     source_class = _resolve_input_source_class(source_type)
@@ -2205,6 +2514,8 @@ async def stream_input_source_preview(
         try:
             # Create persistent receiver
             receiver = source_class()
+            if source_type == "syphon" and hasattr(receiver, "set_flip_vertical"):
+                receiver.set_flip_vertical(flip_vertical)
             connected = await loop.run_in_executor(None, receiver.connect, identifier)
             if not connected:
                 logger.warning(f"Preview stream: could not connect to '{identifier}'")
@@ -2251,7 +2562,7 @@ async def stream_input_source_preview(
 
 @app.get("/api/v1/hardware/info", response_model=HardwareInfoResponse)
 async def get_hardware_info(
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Get hardware information including available VRAM and Spout availability.
 
@@ -2259,7 +2570,7 @@ async def get_hardware_info(
     cloud-hosted scope backend to get the cloud GPU's hardware info.
     """
     try:
-        # If connected to cloud, proxy the request to get cloud's hardware info
+        #  If connected to cloud, proxy the request to get cloud's hardware info
         if cloud_manager.is_connected:
             return await get_hardware_info_from_cloud(
                 cloud_manager,
@@ -2500,6 +2811,7 @@ def _convert_plugin_dict_to_info(plugin_dict: dict) -> "PluginInfo":
         latest_version=plugin_dict.get("latest_version"),
         update_available=plugin_dict.get("update_available"),
         package_spec=plugin_dict.get("package_spec"),
+        bundled=plugin_dict.get("bundled", False),
     )
 
 
@@ -2507,7 +2819,7 @@ def _convert_plugin_dict_to_info(plugin_dict: dict) -> "PluginInfo":
 @cloud_proxy()
 async def list_plugins(
     http_request: Request,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """List all installed plugins with metadata.
 
@@ -2553,7 +2865,7 @@ async def list_plugins(
 async def install_plugin(
     http_request: Request,
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Install a plugin from PyPI, git URL, or local path.
 
@@ -2648,7 +2960,7 @@ async def uninstall_plugin(
     name: str,
     http_request: Request,
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Uninstall a plugin, cleaning up loaded pipelines.
 
@@ -2710,7 +3022,7 @@ async def reload_plugin(
     name: str,
     http_request: Request,
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Reload an editable plugin for development (without server restart).
 
@@ -2790,7 +3102,7 @@ async def reload_plugin(
 @app.post("/api/v1/cloud/connect", response_model=CloudStatusResponse)
 async def connect_to_cloud(
     request: CloudConnectRequest,
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Connect to cloud for remote GPU inference.
 
@@ -2814,7 +3126,6 @@ async def connect_to_cloud(
         # Use request body credentials if provided, otherwise fall back to CLI/env
         app_id = request.app_id or os.environ.get("SCOPE_CLOUD_APP_ID")
         api_key = request.api_key or os.environ.get("SCOPE_CLOUD_API_KEY")
-
         if not app_id:
             raise HTTPException(
                 status_code=400,
@@ -2826,6 +3137,12 @@ async def connect_to_cloud(
             f"Connecting to cloud (background): {app_id} (user_id: {request.user_id})"
         )
         await cloud_manager.connect_background(app_id, api_key, request.user_id)
+
+        # Invalidate cached pipeline schemas so that when the cloud connection
+        # completes, subsequent requests either proxy to the cloud (returning
+        # cloud pipelines) or rebuild from the local registry instead of
+        # serving stale cached data from a previous local-only fetch.
+        _invalidate_plugin_caches()
 
         credentials_configured = bool(os.environ.get("SCOPE_CLOUD_APP_ID"))
         return CloudStatusResponse(
@@ -2842,7 +3159,7 @@ async def connect_to_cloud(
 
 @app.post("/api/v1/cloud/disconnect", response_model=CloudStatusResponse)
 async def disconnect_from_cloud(
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Disconnect from cloud.
 
@@ -2851,6 +3168,10 @@ async def disconnect_from_cloud(
     """
     try:
         await cloud_manager.disconnect()
+        # Invalidate cached pipeline schemas so that post-disconnect requests
+        # rebuild the list from the local registry instead of returning stale
+        # cloud-era data.
+        _invalidate_plugin_caches()
         credentials_configured = bool(os.environ.get("SCOPE_CLOUD_APP_ID"))
         return CloudStatusResponse(
             connected=False,
@@ -2865,7 +3186,7 @@ async def disconnect_from_cloud(
 
 @app.get("/api/v1/cloud/status", response_model=CloudStatusResponse)
 async def get_cloud_status(
-    cloud_manager: "CloudConnectionManager" = Depends(get_cloud_connection_manager),
+    cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
 ):
     """Get current cloud connection status."""
     status = cloud_manager.get_status()
@@ -2895,6 +3216,73 @@ async def get_cloud_stats(
     return cloud_manager.get_status()
 
 
+# ---------------------------------------------------------------------------
+# Onboarding
+# ---------------------------------------------------------------------------
+
+
+def _get_onboarding_file() -> Path:
+    return get_base_dir() / "onboarding.json"
+
+
+class OnboardingStatusResponse(BaseModel):
+    completed: bool
+    inference_mode: str | None = None
+    onboarding_style: str | None = None
+    referral_source: str | None = None
+    use_case: str | None = None
+
+
+class OnboardingStatusUpdate(BaseModel):
+    completed: bool | None = None
+    inference_mode: str | None = None
+    onboarding_style: str | None = None
+    referral_source: str | None = None
+    use_case: str | None = None
+
+
+@app.get("/api/v1/onboarding/status", response_model=OnboardingStatusResponse)
+async def get_onboarding_status():
+    """Read onboarding completion state from onboarding.json."""
+    onboarding_file = _get_onboarding_file()
+    if onboarding_file.exists():
+        try:
+            data = json.loads(onboarding_file.read_text())
+            return OnboardingStatusResponse(
+                completed=data.get("completed", False),
+                inference_mode=data.get("inference_mode"),
+                onboarding_style=data.get("onboarding_style"),
+                referral_source=data.get("referral_source"),
+                use_case=data.get("use_case"),
+            )
+        except Exception:
+            pass
+    return OnboardingStatusResponse(completed=False)
+
+
+@app.put("/api/v1/onboarding/status", response_model=OnboardingStatusResponse)
+async def update_onboarding_status(body: OnboardingStatusUpdate):
+    """Write onboarding completion state to onboarding.json."""
+    onboarding_file = _get_onboarding_file()
+    onboarding_file.parent.mkdir(parents=True, exist_ok=True)
+    # Merge with existing data so we don't lose fields when partially updating
+    existing: dict = {}
+    if onboarding_file.exists():
+        try:
+            existing = json.loads(onboarding_file.read_text())
+        except Exception:
+            pass
+    existing.update(body.model_dump(exclude_none=True))
+    onboarding_file.write_text(json.dumps(existing))
+    return OnboardingStatusResponse(
+        completed=existing.get("completed", False),
+        inference_mode=existing.get("inference_mode"),
+        onboarding_style=existing.get("onboarding_style"),
+        referral_source=existing.get("referral_source"),
+        use_case=existing.get("use_case"),
+    )
+
+
 @app.get("/{path:path}")
 async def serve_frontend(request: Request, path: str):
     """Serve the frontend for all non-API routes (fallback for client-side routing)."""
@@ -2905,7 +3293,9 @@ async def serve_frontend(request: Request, path: str):
         raise HTTPException(status_code=404, detail="Frontend not built")
 
     # Check if requesting a specific file that exists
-    file_path = frontend_dist / path
+    file_path = (frontend_dist / path).resolve()
+    if not file_path.is_relative_to(frontend_dist.resolve()):
+        raise HTTPException(status_code=403, detail="Access denied")
     if file_path.exists() and file_path.is_file():
         # Determine media type based on extension to fix MIME type issues on Windows
         file_extension = file_path.suffix.lower()
@@ -3034,7 +3424,9 @@ def run_server(reload: bool, host: str, port: int, no_browser: bool):
 @click.option(
     "--reload", is_flag=True, help="Enable auto-reload for development (default: False)"
 )
-@click.option("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+@click.option(
+    "--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)"
+)
 @click.option("--port", default=8000, help="Port to bind to (default: 8000)")
 @click.option(
     "-N",

@@ -7,6 +7,7 @@ import random
 import threading
 import time
 from collections import deque
+from fractions import Fraction
 from typing import Any
 
 import torch
@@ -14,6 +15,12 @@ import torch
 from scope.core.pipelines.controller import parse_ctrl_input
 
 from .kafka_publisher import publish_event
+from .media_packets import (
+    AudioPacket,
+    MediaTimestamp,
+    VideoPacket,
+    ensure_video_packet,
+)
 from .pipeline_manager import PipelineNotAvailableException
 from .tempo_sync import get_beat_boundary
 
@@ -23,6 +30,10 @@ logger = logging.getLogger(__name__)
 OUTPUT_QUEUE_MAX_SIZE_FACTOR = 2
 
 SLEEP_TIME = 0.01
+
+# Sentinel sample_rate value used to signal the audio track to flush its buffer.
+# Sent as (None, AUDIO_FLUSH_SENTINEL) through the audio_output_queue.
+AUDIO_FLUSH_SENTINEL = -1
 
 # FPS calculation constants
 MIN_FPS = 1.0  # Minimum FPS to prevent division by zero
@@ -75,6 +86,18 @@ class PipelineProcessor:
         self.output_queues: dict[str, list[queue.Queue]] = {}
         # Lock to protect input_queues assignment for thread-safe reference swapping
         self.input_queue_lock = threading.Lock()
+        # External dict references that hold output queues (e.g. sink_queues_by_node,
+        # record_queues_by_node). Updated by _resize_output_queue so cached
+        # references stay in sync when a queue object is replaced.
+        self.external_queue_refs: list[tuple[dict, str]] = []
+
+        # Audio output queue: (audio_tensor, sample_rate) tuples.
+        # Consumed by FrameProcessor.get_audio() on the sink processor.
+        # Flushed on prompt change, so only needs enough headroom for
+        # bursty production (pipeline thread outpacing real-time playback).
+        self.audio_output_queue: queue.Queue[AudioPacket | tuple[torch.Tensor, int]] = (
+            queue.Queue(maxsize=10)
+        )
 
         # Current parameters used by processing thread
         self.parameters = initial_parameters or {}
@@ -114,6 +137,11 @@ class PipelineProcessor:
         # Beat-synced cache reset: fire init_cache=True at rhythmic intervals
         self._beat_cache_reset_rate: str = "none"
         self._last_reset_boundary: int = -1
+
+        # Native frame rate reported by the pipeline (e.g. 24fps for LTX-2).
+        # When set, get_fps() returns this instead of the measured production rate,
+        # giving the video track a stable playback speed for A/V sync.
+        self.native_fps: float | None = None
 
     def set_beat_cache_reset_rate(self, rate: str) -> None:
         """Set the beat-synced cache reset rate and reset the boundary tracker."""
@@ -160,6 +188,11 @@ class PipelineProcessor:
                 with consumer.input_queue_lock:
                     if consumer.input_queues.get(consumer_port) is old_q:
                         consumer.input_queues[consumer_port] = new_q
+
+            # Update external references (sink/record queues in SinkManager)
+            for ref_dict, ref_key in self.external_queue_refs:
+                if ref_dict.get(ref_key) is old_q:
+                    ref_dict[ref_key] = new_q
 
         if resized:
             self.output_queues[port] = new_list
@@ -214,6 +247,22 @@ class PipelineProcessor:
                         break
 
         logger.info(f"PipelineProcessor stopped for pipeline: {self.pipeline_id}")
+
+    def _flush_audio(self):
+        """Drain the audio output queue and send a flush sentinel.
+
+        Called when prompts change so the audio track discards buffered
+        audio from the previous prompt and plays the new speech immediately.
+        """
+        while not self.audio_output_queue.empty():
+            try:
+                self.audio_output_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.audio_output_queue.put_nowait((None, AUDIO_FLUSH_SENTINEL))
+        except queue.Full:
+            pass
 
     def update_parameters(self, parameters: dict[str, Any]):
         """Update parameters that will be used in the next pipeline call."""
@@ -272,16 +321,16 @@ class PipelineProcessor:
 
     def prepare_chunk(
         self, input_queue_ref: queue.Queue, chunk_size: int
-    ) -> list[torch.Tensor]:
+    ) -> list[VideoPacket]:
         """
         Sample frames uniformly from one queue (used when only video port is present).
         """
         step = input_queue_ref.qsize() / chunk_size
         indices = [round(i * step) for i in range(chunk_size)]
-        video_frames = []
+        video_frames: list[VideoPacket] = []
         last_idx = indices[-1]
         for i in range(last_idx + 1):
-            frame = input_queue_ref.get_nowait()
+            frame = ensure_video_packet(input_queue_ref.get_nowait())
             if i in indices:
                 video_frames.append(frame)
         return video_frames
@@ -290,7 +339,7 @@ class PipelineProcessor:
         self,
         input_queues_ref: dict[str, queue.Queue],
         chunk_size: int,
-    ) -> dict[str, list[torch.Tensor]]:
+    ) -> dict[str, list[VideoPacket]]:
         """
         Sample chunk_size frames uniformly from each wired queue.
 
@@ -302,12 +351,50 @@ class PipelineProcessor:
             for port, q in input_queues_ref.items()
         }
 
+    @staticmethod
+    def _normalize_timestamps(
+        raw_timestamps: Any, expected_len: int
+    ) -> list[MediaTimestamp]:
+        if not isinstance(raw_timestamps, list):
+            return [MediaTimestamp() for _ in range(expected_len)]
+
+        normalized: list[MediaTimestamp] = []
+        for ts in raw_timestamps[:expected_len]:
+            if isinstance(ts, MediaTimestamp):
+                normalized.append(ts)
+                continue
+            if isinstance(ts, dict):
+                pts = ts.get("pts")
+                time_base = ts.get("time_base")
+                if time_base is not None and not isinstance(time_base, Fraction):
+                    try:
+                        time_base = Fraction(time_base)
+                    except Exception:
+                        time_base = None
+                normalized.append(MediaTimestamp(pts=pts, time_base=time_base))
+                continue
+            normalized.append(MediaTimestamp())
+
+        if len(normalized) < expected_len:
+            normalized.extend(
+                MediaTimestamp() for _ in range(expected_len - len(normalized))
+            )
+        return normalized
+
     def process_chunk(self):
         """Process a single chunk of frames."""
         # Check if there are new parameters
         try:
             new_parameters = self.parameters_queue.get_nowait()
             if new_parameters != self.parameters:
+                # Flush stale audio when prompts change so the new
+                # speech is heard immediately instead of after the old
+                # audio finishes playing.
+                if "prompts" in new_parameters and new_parameters.get(
+                    "prompts"
+                ) != self.parameters.get("prompts"):
+                    self._flush_audio()
+
                 # Clear stale transition when new prompts arrive without transition
                 if (
                     "prompts" in new_parameters
@@ -377,7 +464,7 @@ class PipelineProcessor:
                     prepare_params["video"] = True
                 requirements = self.pipeline.prepare(**prepare_params)
 
-        chunks: dict[str, list[torch.Tensor]] = {}
+        chunks: dict[str, list[VideoPacket]] = {}
         if requirements is not None:
             current_chunk_size = requirements.input_size
             with self.input_queue_lock:
@@ -397,131 +484,215 @@ class PipelineProcessor:
             else:
                 chunks = self.prepare_multi_chunk(input_queues_ref, current_chunk_size)
 
-        with _lock_ctx:
-            try:
-                # Pass parameters (excluding prepare-only parameters)
-                call_params = dict(self.parameters.items())
+        try:
+            # Pass parameters (excluding prepare-only parameters)
+            call_params = dict(self.parameters.items())
 
-                # Pass reset_cache as init_cache to pipeline
-                call_params["init_cache"] = not self.is_prepared or self._pending_cache_init
-                if reset_cache:
-                    call_params["init_cache"] = True
+            # Pass reset_cache as init_cache to pipeline
+            call_params["init_cache"] = not self.is_prepared or self._pending_cache_init
+            if reset_cache:
+                call_params["init_cache"] = True
 
-                # Pass lora_scales only when present
-                if lora_scales is not None:
-                    call_params["lora_scales"] = lora_scales
+            # Pass lora_scales only when present
+            if lora_scales is not None:
+                call_params["lora_scales"] = lora_scales
 
-                # Extract ctrl_input, parse it, and reset mouse for next frame
-                if "ctrl_input" in self.parameters:
-                    ctrl_data = self.parameters["ctrl_input"]
-                    call_params["ctrl_input"] = parse_ctrl_input(ctrl_data)
-                    # Reset mouse accumulator, keep key state
-                    self.parameters["ctrl_input"]["mouse"] = [0.0, 0.0]
+            # Extract ctrl_input, parse it, and reset mouse for next frame
+            if "ctrl_input" in self.parameters:
+                ctrl_data = self.parameters["ctrl_input"]
+                call_params["ctrl_input"] = parse_ctrl_input(ctrl_data)
+                # Reset mouse accumulator, keep key state
+                self.parameters["ctrl_input"]["mouse"] = [0.0, 0.0]
 
-                # Fill call_params from stream chunks (port names are set by graph edges)
-                if chunks:
-                    for port, frame_list in chunks.items():
-                        call_params[port] = frame_list
-
-                if self.tempo_sync is not None:
-                    call_params = self._apply_tempo_sync(call_params)
-
-                processing_start = time.time()
-                output_dict = self.pipeline(**call_params)
-                processing_time = time.time() - processing_start
-
-                if not output_dict:
-                    return
-
-                # Clear one-shot parameters after use to prevent sending them on subsequent chunks
-                # These parameters should only be sent when explicitly provided in parameter updates
-                one_shot_params = [
-                    "vace_ref_images",
-                    "images",
-                    "first_frame_image",
-                    "last_frame_image",
-                ]
-                for param in one_shot_params:
-                    if param in call_params and param in self.parameters:
-                        self.parameters.pop(param, None)
-
-                # Clear transition when complete
-                if "transition" in call_params and "transition" in self.parameters:
-                    transition_active = False
-                    if hasattr(self.pipeline, "state"):
-                        transition_active = self.pipeline.state.get(
-                            "_transition_active", False
-                        )
-
-                    transition = call_params.get("transition")
-                    if not transition_active or transition is None:
-                        self.parameters.pop("transition", None)
-
-                output = output_dict.get("video")
-                num_frames = 0
-                if output is not None:
-                    num_frames = output.shape[0]
-
-                # Put each output port's frames to its queues (all frame ports are streamed)
-                for port, value in output_dict.items():
-                    if value is None or not isinstance(value, torch.Tensor):
-                        continue
-                    queues = self.output_queues.get(port)
-                    if not queues:
-                        continue
-                    # Resize output queues to fit at least one full batch
-                    target_size = value.shape[0] * OUTPUT_QUEUE_MAX_SIZE_FACTOR
-                    self._resize_output_queue(port, target_size)
-                    # Re-read queues after potential resize – _resize_output_queue
-                    # may replace self.output_queues[port] with a new list.
-                    queues = self.output_queues.get(port)
-                    if not queues:
-                        continue
-                    if value.dtype != torch.uint8:
-                        value = (
-                            (value * 255.0)
-                            .clamp(0, 255)
-                            .to(dtype=torch.uint8)
-                            .contiguous()
-                            .detach()
-                        )
-                    frames = [value[i].unsqueeze(0) for i in range(value.shape[0])]
-                    for frame in frames:
-                        for q in queues:
-                            try:
-                                q.put_nowait(frame if q is queues[0] else frame.clone())
-                            except queue.Full:
-                                logger.debug(
-                                    f"Output queue full for {self.pipeline_id} port '{port}', dropping frame"
-                                )
-
-                # Track batch-level throughput for FPS calculation
-                if output is not None and num_frames > 0:
-                    self._track_output_batch(num_frames, processing_time)
-
-                # Forward extra params (non-video outputs without queues) to downstream
-                # pipelines. Preprocessors may return e.g. {"video": frames,
-                # "vace_input_frames": ..., "vace_input_masks": ...} and the extra
-                # entries need to reach the consuming pipeline as parameters.
-                extra_params = {
-                    k: v for k, v in output_dict.items() if k not in self.output_queues
-                }
-                if extra_params and self.output_consumers:
-                    seen: set[int] = set()
-                    for consumers in self.output_consumers.values():
-                        for consumer_proc, _ in consumers:
-                            proc_id = id(consumer_proc)
-                            if proc_id not in seen:
-                                seen.add(proc_id)
-                                consumer_proc.update_parameters(extra_params)
-
-            except Exception as e:
-                if self._is_recoverable(e):
-                    logger.error(
-                        f"Error processing chunk for {self.pipeline_id}: {e}", exc_info=True
+            # Fill call_params from stream chunks (port names are set by graph edges)
+            if chunks:
+                for port, packet_list in chunks.items():
+                    call_params[port] = [packet.tensor for packet in packet_list]
+                    ts_key = (
+                        "video_timestamps" if port == "video" else f"{port}_timestamps"
                     )
-                else:
-                    raise e
+                    call_params[ts_key] = [packet.timestamp for packet in packet_list]
+
+            if self.tempo_sync is not None:
+                call_params = self._apply_tempo_sync(call_params)
+
+            processing_start = time.time()
+            with _lock_ctx:
+                output_dict = self.pipeline(**call_params)
+            processing_time = time.time() - processing_start
+
+            if not output_dict:
+                # 1) Some pipelines return {} when idle
+                # 2) For those, prepare() is None, so we never wait on input queues.
+                # 3) Without this sleep the worker thread would busy-loop.
+                self.shutdown_event.wait(SLEEP_TIME)
+                return
+
+            # Pass audio to output queue regardless of whether video exists.
+            # This ensures audio-only pipelines can deliver audio.
+            audio_output = output_dict.get("audio")
+            audio_sample_rate = output_dict.get("audio_sample_rate")
+            if audio_output is not None and audio_sample_rate is not None:
+                try:
+                    audio_cpu = audio_output.detach().cpu()
+                    audio_ts = output_dict.get("audio_timestamps")
+                    timestamp = MediaTimestamp()
+                    if isinstance(audio_ts, list) and audio_ts:
+                        first = audio_ts[0]
+                        if isinstance(first, MediaTimestamp):
+                            timestamp = first
+                    elif isinstance(audio_ts, MediaTimestamp):
+                        timestamp = audio_ts
+                    self.audio_output_queue.put_nowait(
+                        AudioPacket(
+                            audio=audio_cpu,
+                            sample_rate=audio_sample_rate,
+                            timestamp=timestamp,
+                        )
+                    )
+                except queue.Full:
+                    logger.warning(
+                        "Audio output queue full for %s, dropping audio chunk",
+                        self.pipeline_id,
+                    )
+
+            # Extract video from the returned dictionary
+            output = output_dict.get("video")
+            if output is None:
+                self.is_prepared = True
+                self._pending_cache_init = False
+                return
+
+            # Clear one-shot parameters after use to prevent sending them on subsequent chunks
+            # These parameters should only be sent when explicitly provided in parameter updates
+            one_shot_params = [
+                "vace_ref_images",
+                "images",
+                "first_frame_image",
+                "last_frame_image",
+            ]
+            for param in one_shot_params:
+                if param in call_params and param in self.parameters:
+                    self.parameters.pop(param, None)
+
+            # Clear transition when complete
+            if "transition" in call_params and "transition" in self.parameters:
+                transition_active = False
+                if hasattr(self.pipeline, "state"):
+                    transition_active = self.pipeline.state.get(
+                        "_transition_active", False
+                    )
+
+                transition = call_params.get("transition")
+                if not transition_active or transition is None:
+                    self.parameters.pop("transition", None)
+
+            num_frames = 0
+            if output is not None:
+                num_frames = output.shape[0]
+
+            # Put each output port's frames to its queues (all frame ports are streamed)
+            for port, value in output_dict.items():
+                if value is None or not isinstance(value, torch.Tensor):
+                    continue
+                queues = self.output_queues.get(port)
+                if not queues:
+                    continue
+                # Convert batch-format tensors [B, C, F, H, W] to frame format
+                # [B*F, H, W, C] so they can be split and queued as individual
+                # frames.  This handles outputs from preprocessor pipelines
+                # (e.g. VACE frames/masks) which produce pre-batched 5D tensors
+                # rather than per-frame 4D tensors.
+                if value.dim() == 5:
+                    b, c, f, h, w = value.shape
+                    value = (
+                        value.permute(0, 2, 3, 4, 1)
+                        .reshape(b * f, h, w, c)
+                        .contiguous()
+                    )
+                    # Convert [-1, 1] to [0, 1] for uint8 encoding; downstream
+                    # preprocess_chunk reverses this via (x / 255) * 2 - 1.
+                    if value.min() < 0:
+                        value = (value + 1.0) / 2.0
+                # Resize output queues to fit at least one full batch
+                target_size = value.shape[0] * OUTPUT_QUEUE_MAX_SIZE_FACTOR
+                self._resize_output_queue(port, target_size)
+                # Re-read queues after potential resize – _resize_output_queue
+                # may replace self.output_queues[port] with a new list.
+                queues = self.output_queues.get(port)
+                if not queues:
+                    continue
+                if value.dtype != torch.uint8:
+                    value = (
+                        (value * 255.0)
+                        .clamp(0, 255)
+                        .to(dtype=torch.uint8)
+                        .contiguous()
+                        .detach()
+                    )
+                frames = [value[i].unsqueeze(0) for i in range(value.shape[0])]
+                ts_key = f"{port}_timestamps"
+                raw_timestamps = output_dict.get(ts_key)
+                if port == "video" and raw_timestamps is None:
+                    raw_timestamps = output_dict.get("video_timestamps")
+                timestamps = self._normalize_timestamps(raw_timestamps, len(frames))
+                for idx, frame in enumerate(frames):
+                    packet = VideoPacket(tensor=frame, timestamp=timestamps[idx])
+                    for q in queues:
+                        try:
+                            if q is queues[0]:
+                                q.put_nowait(packet)
+                            else:
+                                q.put_nowait(
+                                    VideoPacket(
+                                        tensor=packet.tensor.clone(),
+                                        timestamp=packet.timestamp,
+                                    )
+                                )
+                        except queue.Full:
+                            logger.debug(
+                                f"Output queue full for {self.pipeline_id} port '{port}', dropping frame"
+                            )
+
+            # Latch native frame rate for stable playback speed.
+            # Check output dict first, then pipeline config as fallback.
+            frame_rate = output_dict.get("frame_rate")
+            if frame_rate is None and hasattr(self.pipeline, "config"):
+                frame_rate = getattr(self.pipeline.config, "frame_rate", None)
+            if frame_rate is not None and float(frame_rate) > 0:
+                self.native_fps = float(frame_rate)
+
+            # Track batch-level throughput for FPS calculation
+            if output is not None and num_frames > 0:
+                self._track_output_batch(num_frames, processing_time)
+
+            # Forward extra params (non-video outputs without queues) to downstream
+            # pipelines. Preprocessors may return e.g. {"video": frames,
+            # "vace_input_frames": ..., "vace_input_masks": ...} and the extra
+            # entries need to reach the consuming pipeline as parameters.
+            extra_params = {
+                k: v
+                for k, v in output_dict.items()
+                if k not in self.output_queues
+                and k not in {"video_timestamps", "audio_timestamps"}
+                and not k.endswith("_timestamps")
+            }
+            if extra_params and self.output_consumers:
+                seen: set[int] = set()
+                for consumers in self.output_consumers.values():
+                    for consumer_proc, _ in consumers:
+                        proc_id = id(consumer_proc)
+                        if proc_id not in seen:
+                            seen.add(proc_id)
+                            consumer_proc.update_parameters(extra_params)
+
+        except Exception as e:
+            if self._is_recoverable(e):
+                logger.error(
+                    f"Error processing chunk for {self.pipeline_id}: {e}", exc_info=True
+                )
+            else:
+                raise e
 
         self.is_prepared = True
         self._pending_cache_init = False
@@ -606,11 +777,14 @@ class PipelineProcessor:
                     self.current_output_fps = max(MIN_FPS, min(MAX_FPS, fps))
 
     def get_fps(self) -> float:
-        """Get the current dynamically calculated pipeline FPS.
+        """Get the playback FPS for this pipeline's output.
 
-        Returns the FPS based on how fast frames are produced into the output queue,
-        adjusted for queue fill level to prevent buildup.
+        If the pipeline reports a native frame rate (e.g. 24fps for LTX-2),
+        that value is returned for stable playback. Otherwise falls back to
+        the measured production rate.
         """
+        if self.native_fps is not None:
+            return self.native_fps
         with self.output_fps_lock:
             output_fps = self.current_output_fps
         return min(MAX_FPS, output_fps)

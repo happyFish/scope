@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -76,6 +77,7 @@ class CloudConnectionManager:
         # WebRTC client for media relay
         self._webrtc_client: CloudWebRTCClient | None = None
         self._frame_callbacks: list[Callable[[VideoFrame], None]] = []
+        self._audio_callbacks: list[Callable] = []
 
         # Stats tracking
         self._stats = {
@@ -265,6 +267,11 @@ class CloudConnectionManager:
 
     def _build_ws_url(self) -> str:
         """Build WebSocket URL with JWT token."""
+        # Allow overriding the full WS URL for local cloud testing
+        override = os.environ.get("SCOPE_CLOUD_WS_URL")
+        if override:
+            return override
+
         app_id = self.app_id.strip("/") if self.app_id else ""
         # Ensure we're connecting to the /ws endpoint
         if not app_id.endswith("/ws"):
@@ -629,9 +636,6 @@ class CloudConnectionManager:
         self._connect_stage = "Setting up video stream..."
         self._webrtc_client = CloudWebRTCClient(self)
 
-        # Register frame callback to update stats and forward to subscribers
-        self._webrtc_client.output_handler.add_callback(self._on_frame_from_cloud)
-
         try:
             await self._webrtc_client.connect(initial_parameters)
             self._connect_stage = None
@@ -642,6 +646,11 @@ class CloudConnectionManager:
             self._webrtc_client = None
             raise
 
+        # Register frame/audio callbacks AFTER connect() because connect()
+        # recreates output_handlers — callbacks added before would be lost.
+        self._webrtc_client.output_handler.add_callback(self._on_frame_from_cloud)
+        self._webrtc_client.audio_output_handler.add_callback(self._on_audio_from_cloud)
+
     async def stop_webrtc(self) -> None:
         """Stop the WebRTC connection to cloud.ai."""
         if self._webrtc_client is not None:
@@ -650,11 +659,22 @@ class CloudConnectionManager:
             self._webrtc_client = None
             logger.info("WebRTC connection stopped")
 
+    def get_webrtc_client(self):
+        """Return the underlying WebRTC client, or None if not connected."""
+        return self._webrtc_client
+
     def send_frame(self, frame: VideoFrame | np.ndarray) -> bool:
-        """Send a video frame to cloud.ai for processing.
+        """Send a frame to cloud input track index 0."""
+        return self.send_frame_to_track(frame, 0)
+
+    def send_frame_to_track(
+        self, frame: VideoFrame | np.ndarray, track_index: int
+    ) -> bool:
+        """Send a video frame to a specific cloud input track.
 
         Args:
             frame: VideoFrame or numpy array (RGB24 format)
+            track_index: Index into input_tracks on the WebRTC client
 
         Returns:
             True if frame was queued, False if not connected or queue full
@@ -662,10 +682,16 @@ class CloudConnectionManager:
         if self._webrtc_client is None or not self._webrtc_client.is_connected:
             return False
 
-        success = self._webrtc_client.send_frame(frame)
+        success = self._webrtc_client.send_frame_to_track(frame, track_index)
         if success:
             self._stats["frames_sent_to_cloud"] += 1
         return success
+
+    def get_source_track_index(self, node_id: str) -> int | None:
+        """Return the cloud input track index for a given source node ID."""
+        if self._webrtc_client is None:
+            return None
+        return self._webrtc_client.source_node_to_track_index.get(node_id)
 
     def send_parameters(self, params: dict) -> None:
         """Send parameter update to cloud.ai via WebRTC data channel.
@@ -701,6 +727,23 @@ class CloudConnectionManager:
                 callback(frame)
             except Exception as e:
                 logger.error(f"Error in frame callback: {e}")
+
+    def add_audio_callback(self, callback: Callable) -> None:
+        """Register a callback to receive audio frames from cloud.ai."""
+        self._audio_callbacks.append(callback)
+
+    def remove_audio_callback(self, callback: Callable) -> None:
+        """Remove an audio callback."""
+        if callback in self._audio_callbacks:
+            self._audio_callbacks.remove(callback)
+
+    def _on_audio_from_cloud(self, frame) -> None:
+        """Handle audio frames received from cloud.ai."""
+        for callback in self._audio_callbacks:
+            try:
+                callback(frame)
+            except Exception as e:
+                logger.error(f"Error in audio callback: {e}")
 
     @property
     def cloud_session_id(self) -> str | None:

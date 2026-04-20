@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import VIDEO_TIME_BASE, MediaStreamTrack
-from av import VideoFrame
+from av import AudioFrame, VideoFrame
 
 if TYPE_CHECKING:
     from .cloud_connection import CloudConnectionManager
@@ -141,6 +141,41 @@ class FrameOutputHandler:
         return self._last_frame
 
 
+class AudioOutputHandler:
+    """Handles audio frames received FROM cloud.
+
+    Audio frames from cloud are passed to registered callbacks,
+    which can forward them to FrameProcessor's cloud audio queue.
+    """
+
+    def __init__(self):
+        self._callbacks: list[Callable[[AudioFrame], None]] = []
+        self._frame_count = 0
+
+    def add_callback(self, callback: Callable[[AudioFrame], None]):
+        """Register a callback to receive audio frames."""
+        self._callbacks.append(callback)
+
+    def remove_callback(self, callback: Callable[[AudioFrame], None]):
+        """Remove an audio callback."""
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
+    def handle_frame(self, frame: AudioFrame):
+        """Called when an audio frame is received from cloud."""
+        self._frame_count += 1
+
+        for callback in self._callbacks:
+            try:
+                callback(frame)
+            except Exception as e:
+                logger.error(f"Error in audio callback: {e}")
+
+    @property
+    def frame_count(self) -> int:
+        return self._frame_count
+
+
 class CloudWebRTCClient:
     """WebRTC client that connects to cloud for remote processing.
 
@@ -152,7 +187,7 @@ class CloudWebRTCClient:
         await client.connect()
 
         # Send frames to cloud
-        client.input_track.put_frame(frame)
+        client.input_tracks[0].put_frame(frame)
 
         # Receive processed frames
         client.output_handler.add_callback(my_callback)
@@ -161,20 +196,33 @@ class CloudWebRTCClient:
     def __init__(self, cloud_manager: CloudConnectionManager):
         self.cloud_manager = cloud_manager
         self.pc: RTCPeerConnection | None = None
-        self.input_track: FrameInputTrack | None = None
-        self.output_handler = FrameOutputHandler()
+        self.input_tracks: list[FrameInputTrack] = []
+        self.output_handlers: list[FrameOutputHandler] = [FrameOutputHandler()]
+        self.audio_output_handler = AudioOutputHandler()
+        # Source node ID → cloud input track index. Populated by connect()
+        # from the graph in initial_parameters; initialized here so callers
+        # of `get_source_track_index` never see AttributeError between
+        # client construction and the first connect().
+        self.source_node_to_track_index: dict[str, int] = {}
         self._data_channel = None
         self._session_id: str | None = None
         self._connected = False
-        self._receive_task: asyncio.Task | None = None
+        self._receive_tasks: list[asyncio.Task] = []
+        self._audio_receive_task: asyncio.Task | None = None
 
         # Stats
         self._stats = {
             "frames_sent": 0,
             "frames_received": 0,
+            "audio_frames_received": 0,
             "connected_at": None,
             "connection_state": "new",
         }
+
+    @property
+    def output_handler(self) -> FrameOutputHandler:
+        """Primary output handler (index 0)."""
+        return self.output_handlers[0]
 
     @property
     def is_connected(self) -> bool:
@@ -183,6 +231,33 @@ class CloudWebRTCClient:
     @property
     def session_id(self) -> str | None:
         return self._session_id
+
+    @staticmethod
+    def _parse_graph(
+        graph_data: dict,
+    ) -> tuple[int, int, dict[str, int]]:
+        """Parse graph nodes to count sources, extra outputs, and map source IDs.
+
+        Returns:
+            (num_sources, num_extra_outputs, source_node_to_track_index)
+            where num_extra_outputs = (sinks - 1) + record_nodes.
+        """
+        src_count = 0
+        sink_count = 0
+        record_count = 0
+        source_node_to_track_index: dict[str, int] = {}
+        for node in graph_data.get("nodes", []):
+            node_type = node.get("type")
+            if node_type == "source":
+                source_node_to_track_index[node["id"]] = src_count
+                src_count += 1
+            elif node_type == "sink":
+                sink_count += 1
+            elif node_type == "record":
+                record_count += 1
+        num_sources = max(src_count, 1)
+        num_extra_outputs = max(0, sink_count - 1) + record_count
+        return num_sources, num_extra_outputs, source_node_to_track_index
 
     async def connect(self, initial_parameters: dict | None = None) -> None:
         """Establish WebRTC connection to cloud.
@@ -212,9 +287,44 @@ class CloudWebRTCClient:
         )
         self.pc = RTCPeerConnection(config)
 
-        # Create input track for sending frames to cloud
-        self.input_track = FrameInputTrack(fps=30)
-        self.pc.addTrack(self.input_track)
+        # Parse graph to determine track counts
+        params = initial_parameters or {}
+        num_sources = 1
+        num_extra_outputs = 0
+        self.source_node_to_track_index: dict[str, int] = {}
+        graph_data = params.get("graph")
+        if graph_data and isinstance(graph_data, dict):
+            num_sources, num_extra_outputs, self.source_node_to_track_index = (
+                self._parse_graph(graph_data)
+            )
+            # Tell the cloud which source nodes have WebRTC tracks and
+            # in what order. The cloud relay receives tracks for ALL
+            # sources (including hardware ones like NDI/Syphon/Spout),
+            # unlike a browser which only sends file/camera tracks.
+            if initial_parameters is not None and self.source_node_to_track_index:
+                initial_parameters["source_track_order"] = sorted(
+                    self.source_node_to_track_index,
+                    key=self.source_node_to_track_index.__getitem__,
+                )
+
+        # Create input track(s) — one per source node
+        self.input_tracks = []
+        for _ in range(num_sources):
+            track = FrameInputTrack(fps=30)
+            self.input_tracks.append(track)
+            self.pc.addTrack(track)
+
+        # Only add a recvonly audio transceiver when the pipeline produces
+        # audio, so the cloud doesn't waste resources encoding/sending silence.
+        if params.get("produces_audio", False):
+            self.pc.addTransceiver("audio", direction="recvonly")
+
+        # Add recvonly transceivers for extra outputs (extra sinks + record nodes)
+        # and pre-create their output handlers.
+        self.output_handlers = [FrameOutputHandler()]
+        for _ in range(num_extra_outputs):
+            self.pc.addTransceiver("video", direction="recvonly")
+            self.output_handlers.append(FrameOutputHandler())
 
         # Create data channel for parameter updates
         self._data_channel = self.pc.createDataChannel("parameters", ordered=True)
@@ -227,15 +337,30 @@ class CloudWebRTCClient:
         def on_dc_message(message):
             logger.debug(f"Data channel message: {message}")
 
-        # Handle incoming track (processed frames from cloud)
+        # Handle incoming tracks (processed frames from cloud).
+        # Each video track maps to an output handler by receive order.
+        received_video_count = [0]
+
         @self.pc.on("track")
         async def on_track(track: MediaStreamTrack):
-            logger.info(f"Received track: {track.kind}")
             if track.kind == "video":
-                self._receive_task = asyncio.create_task(self._receive_frames(track))
-                # Request keyframe immediately to avoid VP8 decode errors
-                # PLI (Picture Loss Indication) tells remote to send an I-frame
-                asyncio.create_task(self._request_keyframe())
+                idx = received_video_count[0]
+                received_video_count[0] += 1
+                logger.info(f"Received video track from cloud (index={idx})")
+                if idx < len(self.output_handlers):
+                    task = asyncio.create_task(
+                        self._receive_frames(track, self.output_handlers[idx])
+                    )
+                    self._receive_tasks.append(task)
+                    if idx == 0:
+                        asyncio.create_task(self._request_keyframe())
+                else:
+                    logger.warning(f"No output handler for cloud video track {idx}")
+            elif track.kind == "audio":
+                logger.info("Received audio track from cloud")
+                self._audio_receive_task = asyncio.create_task(
+                    self._receive_audio(track)
+                )
 
         # Monitor connection state
         @self.pc.on("connectionstatechange")
@@ -306,8 +431,17 @@ class CloudWebRTCClient:
 
         logger.info("Connection established successfully")
 
-    async def _receive_frames(self, track: MediaStreamTrack):
-        """Background task to receive frames from cloud."""
+    async def _receive_frames(
+        self,
+        track: MediaStreamTrack,
+        handler: FrameOutputHandler,
+    ):
+        """Background task to receive frames from cloud.
+
+        Args:
+            track: The cloud video track to read from.
+            handler: Output handler to dispatch frames to.
+        """
         from aiortc.mediastreams import MediaStreamError
 
         logger.info("Starting frame receive loop")
@@ -332,7 +466,7 @@ class CloudWebRTCClient:
                         )
 
                     # Pass to output handler
-                    self.output_handler.handle_frame(frame)
+                    handler.handle_frame(frame)
 
                 except MediaStreamError:
                     logger.info("Track ended")
@@ -357,6 +491,55 @@ class CloudWebRTCClient:
             logger.info(
                 f"Frame receive loop ended, "
                 f"total frames: {self._stats['frames_received']}"
+            )
+
+    async def _receive_audio(self, track: MediaStreamTrack):
+        """Background task to receive audio frames from cloud."""
+        from aiortc.mediastreams import MediaStreamError
+
+        logger.info("Starting audio receive loop")
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+
+        try:
+            while True:
+                try:
+                    frame = await track.recv()
+                    consecutive_errors = 0
+                    self._stats["audio_frames_received"] += 1
+
+                    if self._stats["audio_frames_received"] == 1:
+                        logger.info(
+                            f"First audio frame received from cloud "
+                            f"(sample_rate={frame.sample_rate}, "
+                            f"samples={frame.samples})"
+                        )
+
+                    self.audio_output_handler.handle_frame(frame)
+
+                except MediaStreamError:
+                    logger.info("Audio track ended")
+                    break
+                except Exception as e:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(
+                            f"Error receiving audio, stopping after "
+                            f"{consecutive_errors} consecutive errors: {e}"
+                        )
+                        break
+                    logger.warning(
+                        f"Transient error receiving audio "
+                        f"({consecutive_errors}/{max_consecutive_errors}): {e}"
+                    )
+                    await asyncio.sleep(0.01)
+
+        except asyncio.CancelledError:
+            logger.info("Audio receive loop cancelled")
+        finally:
+            logger.info(
+                f"Audio receive loop ended, "
+                f"total frames: {self._stats['audio_frames_received']}"
             )
 
     async def _request_keyframe(self):
@@ -399,18 +582,27 @@ class CloudWebRTCClient:
             logger.debug(f"Could not send PLI: {e}")
 
     def send_frame(self, frame: VideoFrame | np.ndarray) -> bool:
-        """Send a frame to cloud for processing.
+        """Send a frame to the primary (index 0) cloud input track."""
+        return self.send_frame_to_track(frame, 0)
+
+    def send_frame_to_track(
+        self, frame: VideoFrame | np.ndarray, track_index: int
+    ) -> bool:
+        """Send a frame to a specific cloud input track.
 
         Args:
             frame: VideoFrame or numpy array (RGB24)
+            track_index: Index into self.input_tracks
 
         Returns:
-            True if frame was queued, False if queue is full
+            True if frame was queued, False if queue is full or index invalid
         """
-        if not self.is_connected or self.input_track is None:
+        if not self.is_connected:
+            return False
+        if track_index < 0 or track_index >= len(self.input_tracks):
             return False
 
-        success = self.input_track.put_frame(frame)
+        success = self.input_tracks[track_index].put_frame(frame)
         if success:
             self._stats["frames_sent"] += 1
         return success
@@ -431,19 +623,28 @@ class CloudWebRTCClient:
 
         self._connected = False
 
-        if self._receive_task:
-            self._receive_task.cancel()
+        for task in self._receive_tasks:
+            task.cancel()
             try:
-                await self._receive_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._receive_task = None
+        self._receive_tasks.clear()
+
+        if self._audio_receive_task:
+            self._audio_receive_task.cancel()
+            try:
+                await self._audio_receive_task
+            except asyncio.CancelledError:
+                pass
+            self._audio_receive_task = None
 
         if self.pc:
             await self.pc.close()
             self.pc = None
 
-        self.input_track = None
+        self.input_tracks = []
+        self.output_handlers = [FrameOutputHandler()]
         self._data_channel = None
         self._session_id = None
 

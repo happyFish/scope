@@ -41,9 +41,9 @@ class GraphNode(BaseModel):
         ...,
         description="Unique node id (e.g. 'input', 'yolo_plugin', 'longlive', 'output')",
     )
-    type: Literal["source", "pipeline", "sink"] = Field(
+    type: Literal["source", "pipeline", "sink", "record"] = Field(
         ...,
-        description="source = external input, pipeline = pipeline instance, sink = output",
+        description="source = external input, pipeline = pipeline instance, sink = output, record = file recorder",
     )
     pipeline_id: str | None = Field(
         default=None,
@@ -56,6 +56,22 @@ class GraphNode(BaseModel):
     source_name: str | None = Field(
         default=None,
         description="Source name/identifier for Spout/NDI/Syphon sources (sender name for Spout, source identifier for NDI/Syphon)",
+    )
+    source_flip_vertical: bool = Field(
+        default=False,
+        description="When true for Syphon sources, flip frames vertically before routing them into the graph.",
+    )
+    tempo_sync: bool = Field(
+        default=False,
+        description="When true, this pipeline receives beat state injection, modulation, and beat cache resets.",
+    )
+    sink_mode: str | None = Field(
+        default=None,
+        description="Output sink mode for sink nodes: 'spout', 'ndi', 'syphon'. When set, frames are sent to the specified output sink instead of (or in addition to) WebRTC.",
+    )
+    sink_name: str | None = Field(
+        default=None,
+        description="Sink name/identifier for Spout/NDI/Syphon output sinks (sender name for Spout, source identifier for NDI/Syphon)",
     )
 
 
@@ -94,6 +110,10 @@ class GraphConfig(BaseModel):
         """Return node ids that are sink nodes."""
         return [n.id for n in self.nodes if n.type == "sink"]
 
+    def get_record_node_ids(self) -> list[str]:
+        """Return node ids that are record nodes."""
+        return [n.id for n in self.nodes if n.type == "record"]
+
     def edges_from(self, node_id: str) -> list[GraphEdge]:
         """Return edges whose source is the given node."""
         return [e for e in self.edges if e.from_node == node_id]
@@ -106,19 +126,12 @@ class GraphConfig(BaseModel):
         """Return stream edges whose source is the given node."""
         return [e for e in self.edges_from(node_id) if e.kind == "stream"]
 
-    def node_by_id(self, node_id: str) -> GraphNode | None:
-        """Return the node with the given id."""
-        for n in self.nodes:
-            if n.id == node_id:
-                return n
-        return None
-
     def validate_structure(self) -> list[str]:
         """Validate the graph structure and return a list of error messages.
 
         Checks:
         - No duplicate node IDs
-        - At least one source and one sink node
+        - At least one sink node (source nodes are optional)
         - Pipeline nodes have a pipeline_id
         - All edge references point to existing nodes
         """
@@ -132,9 +145,7 @@ class GraphConfig(BaseModel):
                 errors.append(f"Duplicate node ID: '{nid}'")
             seen.add(nid)
 
-        # At least one source and one sink
-        if not self.get_source_node_ids():
-            errors.append("Graph must have at least one source node")
+        # At least one sink
         if not self.get_sink_node_ids():
             errors.append("Graph must have at least one sink node")
 

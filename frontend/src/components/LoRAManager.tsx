@@ -16,7 +16,6 @@ import { useLoRAsContext } from "../contexts/LoRAsContext";
 import { useCloudStatus } from "../hooks/useCloudStatus";
 import { FilePicker } from "./ui/file-picker";
 import { MIDIMappable } from "./MIDIMappable";
-
 interface LoRAManagerProps {
   loras: LoRAConfig[];
   onLorasChange: (loras: LoRAConfig[]) => void;
@@ -72,11 +71,13 @@ export function LoRAManager({
       scale: 1.0,
       mergeMode: loraMergeStrategy,
     };
-    onLorasChange([...loras, newLora]);
+    const newLoras = [...loras, newLora];
+    onLorasChange(newLoras);
   };
 
   const handleRemoveLora = (id: string) => {
-    onLorasChange(loras.filter(lora => lora.id !== id));
+    const newLoras = loras.filter(lora => lora.id !== id);
+    onLorasChange(newLoras);
   };
 
   const handleLoraChange = (id: string, updates: Partial<LoRAConfig>) => {
