@@ -13,6 +13,10 @@ class Requirements(BaseModel):
     """Requirements for pipeline configuration."""
 
     input_size: int
+    max_input_queue_size: int | None = None
+    """Cap the input queue depth. Use small values (e.g. 2) for low-latency
+    real-time pipelines where dropping old frames is preferable to lag.
+    Defaults to None, which lets the executor use DEFAULT_INPUT_QUEUE_MAXSIZE (30)."""
 
 
 class Pipeline(ABC):

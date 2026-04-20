@@ -324,7 +324,26 @@ class PipelineProcessor:
     ) -> list[VideoPacket]:
         """
         Sample frames uniformly from one queue (used when only video port is present).
+
+        For chunk_size=1, drains the entire queue and returns only the newest frame to
+        minimise input-to-output latency. The uniform-sampling formula reduces to
+        indices=[0] for chunk_size=1, which would always pick the oldest frame and
+        leave the rest in the queue, causing unbounded latency when the pipeline is
+        slower than the input rate.
+
+        For chunk_size>1, implements uniform sampling across the entire queue to ensure
+        temporal coverage of input frames.
         """
+        if chunk_size == 1:
+            # Drain the queue and keep only the newest frame to avoid latency buildup.
+            frame = None
+            while not input_queue_ref.empty():
+                try:
+                    frame = input_queue_ref.get_nowait()
+                except queue.Empty:
+                    break
+            return [frame] if frame is not None else []
+
         step = input_queue_ref.qsize() / chunk_size
         indices = [round(i * step) for i in range(chunk_size)]
         video_frames: list[VideoPacket] = []
@@ -585,6 +604,10 @@ class PipelineProcessor:
 
                 transition = call_params.get("transition")
                 if not transition_active or transition is None:
+                    # Update prompts to target_prompts so subsequent frames don't
+                    # snap back to the pre-transition prompt
+                    if transition and "target_prompts" in transition:
+                        self.parameters["prompts"] = transition["target_prompts"]
                     self.parameters.pop("transition", None)
 
             num_frames = 0
