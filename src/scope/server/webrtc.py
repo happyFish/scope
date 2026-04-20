@@ -28,6 +28,7 @@ from .credentials import get_turn_credentials
 from .frame_processor import FrameProcessor
 from .headless import HeadlessSession
 from .kafka_publisher import publish_event
+from .livepeer import LivepeerConnection
 from .pipeline_manager import PipelineManager
 from .recording import RecordingManager
 from .schema import WebRTCOfferRequest
@@ -61,23 +62,29 @@ vpx.MAX_BITRATE = 10000000
 
 def _parse_graph_node_ids(
     initial_parameters: dict,
-) -> tuple[list[str], list[str], list[str], list[str], bool]:
+) -> tuple[list[str], list[str], list[str], list[str], list[str], bool]:
     """Extract sink, source, and record node IDs from graph initial parameters.
 
     Returns:
         (webrtc_sink_node_ids, webrtc_source_node_ids,
-         all_sink_node_ids, record_node_ids, has_non_webrtc_sources)
+         all_sink_node_ids, all_source_node_ids,
+         record_node_ids, has_non_webrtc_sources)
 
     ``webrtc_sink_node_ids`` excludes sink nodes that have a non-WebRTC
     ``sink_mode`` (spout/ndi/syphon) since those are handled by per-node
     output sinks in FrameProcessor.
     ``all_sink_node_ids`` includes every sink node regardless of mode.
+    ``webrtc_source_node_ids`` excludes hardware sources (spout/ndi/syphon).
+    ``all_source_node_ids`` includes every source node regardless of mode;
+    used by the cloud's ``handle_offer`` where hardware-source frames arrive
+    via WebRTC tracks relayed by the local instance.
     ``record_node_ids`` contains IDs of record-type nodes that need
     dedicated output tracks in cloud mode.
     """
     webrtc_sink_node_ids: list[str] = []
     all_sink_node_ids: list[str] = []
     webrtc_source_node_ids: list[str] = []
+    all_source_node_ids: list[str] = []
     record_node_ids: list[str] = []
     has_non_webrtc_sources = False
     graph_data = initial_parameters.get("graph")
@@ -89,6 +96,7 @@ def _parse_graph_node_ids(
                 if sm not in ("spout", "ndi", "syphon"):
                     webrtc_sink_node_ids.append(node["id"])
             elif node.get("type") == "source":
+                all_source_node_ids.append(node["id"])
                 sm = node.get("source_mode", "video")
                 if sm not in ("spout", "ndi", "syphon"):
                     webrtc_source_node_ids.append(node["id"])
@@ -100,6 +108,7 @@ def _parse_graph_node_ids(
         webrtc_sink_node_ids,
         webrtc_source_node_ids,
         all_sink_node_ids,
+        all_source_node_ids,
         record_node_ids,
         has_non_webrtc_sources,
     )
@@ -326,23 +335,66 @@ class WebRTCManager:
 
             # Parse graph from initial parameters to find sink/source/record node IDs
             (
-                sink_node_ids,
+                _,  # webrtc_sink_node_ids (unused — see below)
                 webrtc_source_node_ids,
-                _,  # all_sink_node_ids
+                sink_node_ids,
+                _,  # all_source_node_ids (browser tracks map to webrtc sources only)
                 record_node_ids,
                 has_non_webrtc_sources,
             ) = _parse_graph_node_ids(initial_parameters)
+            # Use all_sink_node_ids (not webrtc_sink_node_ids) so that
+            # SinkOutputTracks are created for every sink, including
+            # NDI/Spout/Syphon ones. In cloud relay mode the cloud sends
+            # all sink output back via WebRTC; in browser mode, the extra
+            # tracks are harmless (attached via addTrack fallback, ignored
+            # by the browser).  The graph executor creates separate
+            # hardware queues for NDI/Spout/Syphon output threads, so
+            # SinkOutputTrack reads from the WebRTC queue without conflict.
+
+            # In cloud relay mode the local instance sends WebRTC tracks for
+            # ALL sources (including NDI/Syphon/Spout) and signals this via
+            # ``source_track_order`` in initial_parameters. Use that list so
+            # incoming tracks are mapped to the correct source nodes.
+            #
+            # In browser mode there is no ``source_track_order``; the browser
+            # only sends tracks for file/camera sources. Use
+            # webrtc_source_node_ids so track indices align with the reduced
+            # set of non-hardware sources.
+            all_source_node_ids_for_routing = initial_parameters.get(
+                "source_track_order", webrtc_source_node_ids
+            )
 
             # If the graph has pipeline nodes, ensure they are loaded keyed by
             # node_id so build_graph can find them via node.id.  The pipeline
             # may already be loaded under its pipeline_id (e.g. from the
             # load_pipeline API), so we re-register it under the node_id key.
+            #
+            # Snapshot original instances first: if a node_id matches an
+            # already-loaded pipeline_id (e.g. node "passthrough" wants
+            # pipeline_id "split-screen", but "passthrough" is also loaded),
+            # a plain alias_pipeline would silently skip the override.  By
+            # snapshotting we guarantee each node gets the correct instance
+            # even when names collide.
             graph_data = initial_parameters.get("graph")
             if graph_data and isinstance(graph_data, dict):
+                original_instances: dict[str, Any] = {}
                 for node in graph_data.get("nodes", []):
                     if node.get("type") == "pipeline" and node.get("pipeline_id"):
                         pid = node["pipeline_id"]
-                        if pipeline_manager.alias_pipeline(node["id"], pid):
+                        if pid not in original_instances:
+                            try:
+                                original_instances[pid] = (
+                                    pipeline_manager.get_pipeline_by_id(pid)
+                                )
+                            except Exception:
+                                pass
+                for node in graph_data.get("nodes", []):
+                    if node.get("type") == "pipeline" and node.get("pipeline_id"):
+                        pid = node["pipeline_id"]
+                        if pid in original_instances:
+                            pipeline_manager.set_pipeline_instance(
+                                node["id"], original_instances[pid]
+                            )
                             logger.info(
                                 f"Re-keyed pipeline {pid} as {node['id']} for graph"
                             )
@@ -450,25 +502,31 @@ class WebRTCManager:
             if recording_enabled and (
                 video_track is not None or audio_track is not None
             ):
-                recording_manager = RecordingManager(
-                    video_track=video_track,
-                    audio_track=audio_track,
-                )
-                session.recording_manager = recording_manager
-                if relay is not None:
-                    recording_manager.set_relay(relay)
-                if audio_relay is not None:
-                    recording_manager.set_audio_relay(audio_relay)
+                # Graph record nodes use per-node RecordingCoordinator via
+                # /api/v1/recordings/...?node_id= — a single session manager
+                # would conflict with multiple stop/download cycles.
+                if record_node_ids:
+                    session.recording_manager = None
+                else:
+                    recording_manager = RecordingManager(
+                        video_track=video_track,
+                        audio_track=audio_track,
+                    )
+                    session.recording_manager = recording_manager
+                    if relay is not None:
+                        recording_manager.set_relay(relay)
+                    if audio_relay is not None:
+                        recording_manager.set_audio_relay(audio_relay)
 
-                async def start_recording_when_ready():
-                    """Start recording when frames start flowing."""
-                    try:
-                        await asyncio.sleep(0.1)
-                        await recording_manager.start_recording()
-                    except Exception as e:
-                        logger.debug(f"Could not start recording yet: {e}")
+                    async def start_recording_when_ready():
+                        """Start recording when frames start flowing."""
+                        try:
+                            await asyncio.sleep(0.1)
+                            await recording_manager.start_recording()
+                        except Exception as e:
+                            logger.debug(f"Could not start recording yet: {e}")
 
-                asyncio.create_task(start_recording_when_ready())
+                    asyncio.create_task(start_recording_when_ready())
             else:
                 session.recording_manager = None
 
@@ -486,20 +544,22 @@ class WebRTCManager:
             def on_track(track: MediaStreamTrack):
                 logger.info(f"Track received: {track.kind} for session {session.id}")
                 if track.kind == "video" and video_track is not None:
-                    if webrtc_source_node_ids:
-                        # Multi-source: route each track via SourceInputHandler
+                    if all_source_node_ids_for_routing:
+                        # Multi-source: route each incoming browser track via
+                        # SourceInputHandler (one track per file/camera source;
+                        # hardware sources do not use this path).
                         idx = received_video_count[0]
                         received_video_count[0] += 1
-                        if idx < len(webrtc_source_node_ids):
+                        if idx < len(all_source_node_ids_for_routing):
                             handler = SourceInputHandler(
                                 frame_processor=video_track.frame_processor,
-                                source_node_id=webrtc_source_node_ids[idx],
+                                source_node_id=all_source_node_ids_for_routing[idx],
                             )
                             handler.start(track)
                             session.input_handlers.append(handler)
                             logger.info(
                                 f"Added input handler for source node "
-                                f"{webrtc_source_node_ids[idx]}"
+                                f"{all_source_node_ids_for_routing[idx]}"
                             )
                     else:
                         video_track.initialize_input_processing(track)
@@ -740,11 +800,12 @@ class WebRTCManager:
 
             # Parse graph from initial parameters for multi-source/sink/record
             (
-                sink_node_ids,
+                _,  # webrtc_sink_node_ids (unused — use all_sink_node_ids)
                 webrtc_source_node_ids,
-                _,  # all_sink_node_ids
+                sink_node_ids,
+                _,  # all_source_node_ids
                 record_node_ids,
-                _,  # has_non_webrtc_sources
+                has_non_webrtc_sources,
             ) = _parse_graph_node_ids(initial_parameters)
 
             # Determine media modalities from initial_parameters. These are
@@ -774,6 +835,10 @@ class WebRTCManager:
             if produces_video:
                 cloud_track = CloudTrack(
                     cloud_manager=cloud_manager,
+                    # Once incoming timestamps are good everywhere,remove this
+                    preserve_output_timestamps=isinstance(
+                        cloud_manager, LivepeerConnection
+                    ),
                     initial_parameters=initial_parameters,
                     user_id=request.user_id,
                     connection_id=request.connection_id,
@@ -816,25 +881,28 @@ class WebRTCManager:
             if recording_enabled and (
                 cloud_track is not None or audio_track is not None
             ):
-                recording_manager = RecordingManager(
-                    video_track=cloud_track,
-                    audio_track=audio_track,
-                )
-                session.recording_manager = recording_manager
-                if relay is not None:
-                    recording_manager.set_relay(relay)
-                if audio_track is not None:
-                    audio_relay = MediaRelay()
-                    recording_manager.set_audio_relay(audio_relay)
+                if record_node_ids:
+                    session.recording_manager = None
+                else:
+                    recording_manager = RecordingManager(
+                        video_track=cloud_track,
+                        audio_track=audio_track,
+                    )
+                    session.recording_manager = recording_manager
+                    if relay is not None:
+                        recording_manager.set_relay(relay)
+                    if audio_track is not None:
+                        audio_relay = MediaRelay()
+                        recording_manager.set_audio_relay(audio_relay)
 
-                async def start_recording_when_ready():
-                    try:
-                        await asyncio.sleep(0.1)
-                        await recording_manager.start_recording()
-                    except Exception as e:
-                        logger.debug(f"Could not start recording yet: {e}")
+                    async def start_recording_when_ready():
+                        try:
+                            await asyncio.sleep(0.1)
+                            await recording_manager.start_recording()
+                        except Exception as e:
+                            logger.debug(f"Could not start recording yet: {e}")
 
-                asyncio.create_task(start_recording_when_ready())
+                    asyncio.create_task(start_recording_when_ready())
             else:
                 session.recording_manager = None
 
@@ -846,24 +914,52 @@ class WebRTCManager:
             def on_track(track: MediaStreamTrack):
                 logger.info(f"Track received: {track.kind} for session {session.id}")
                 if track.kind == "video" and cloud_track is not None:
+                    # When all sources are server-side hardware (Syphon/NDI/
+                    # Spout), ignore the browser video track — it carries no
+                    # useful data and would collide with hardware-source frames
+                    # on the cloud input track, producing corrupt VP8 bitstreams.
+                    if has_non_webrtc_sources and not webrtc_source_node_ids:
+                        logger.info(
+                            "Ignoring browser video track (all sources are "
+                            "server-side hardware)"
+                        )
+                        return
+
                     idx = video_track_index[0]
                     video_track_index[0] += 1
-                    if idx == 0 or not webrtc_source_node_ids:
-                        # Primary source → existing CloudTrack input path
-                        cloud_track.set_source_track(track)
-                    else:
-                        # Extra source → buffer for wiring after cloud connects.
-                        # Map the browser track index to the cloud input track
-                        # index, which may differ when the graph contains
-                        # non-WebRTC sources (Syphon/NDI/Spout) that occupy
-                        # their own cloud input tracks.
-                        cloud_track_idx = idx
+                    if webrtc_source_node_ids:
+                        # Graph with WebRTC source nodes: route ALL browser
+                        # tracks (including the primary) through
+                        # CloudSourceInputHandler so each one writes directly
+                        # to the correct cloud input track.  Using
+                        # set_source_track + _input_loop would funnel frames
+                        # through FrameProcessor.put() → send_frame(generic
+                        # track 0), colliding with hardware-source frames on
+                        # the same track.
+                        #
+                        # Pass the source NODE ID (not the cloud track index)
+                        # to CloudTrack. The cloud track index is resolved
+                        # later inside CloudTrack._start, after the cloud
+                        # relay's webrtc_client has been (re)connected with
+                        # this graph and `source_node_to_track_index` is
+                        # populated. Resolving the index here would either
+                        # use a stale mapping from a prior session or fall
+                        # back to the browser's receive order — both of
+                        # which mis-route Camera frames into Syphon/NDI
+                        # source pipelines for mixed-source graphs.
                         if idx < len(webrtc_source_node_ids):
                             node_id = webrtc_source_node_ids[idx]
-                            mapped = cloud_manager.get_source_track_index(node_id)
-                            if mapped is not None:
-                                cloud_track_idx = mapped
-                        cloud_track.add_extra_source_track(cloud_track_idx, track)
+                            cloud_track.add_extra_source_track(node_id, track)
+                        else:
+                            logger.warning(
+                                f"Browser sent video track index {idx} but "
+                                f"only {len(webrtc_source_node_ids)} WebRTC "
+                                "source node(s) in graph; ignoring extra track"
+                            )
+                    else:
+                        # No graph or non-graph perform mode — use the generic
+                        # CloudTrack input path (single source, no routing).
+                        cloud_track.set_source_track(track)
 
             @pc.on("connectionstatechange")
             async def on_connectionstatechange():
@@ -1173,7 +1269,7 @@ class WebRTCManager:
                     if frame is not None:
                         return frame
         if self.headless_session:
-            frame = self.headless_session.get_last_frame()
+            frame = self.headless_session.get_last_frame(sink_node_id=sink_node_id)
             if frame is not None:
                 return frame
         return None

@@ -34,6 +34,7 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
   const { collapsed, toggleCollapse } = useNodeCollapse();
   const sourceMode = data.sourceMode || "video";
   const sourceName = data.sourceName || "";
+  const sourceFlipVertical = data.sourceFlipVertical === true;
   const localStream = data.localStream as MediaStream | null | undefined;
   const onVideoFileUpload = data.onVideoFileUpload as
     | ((file: File) => Promise<boolean>)
@@ -56,8 +57,7 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
   const onCycleSampleVideo = data.onCycleSampleVideo as
     | (() => void)
     | undefined;
-  const isStreaming = data.isStreaming ?? false;
-
+  const onInitSampleVideo = data.onInitSampleVideo as (() => void) | undefined;
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [ndiSources, setNdiSources] = useState<DiscoveredSource[]>([]);
@@ -70,6 +70,17 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
       videoRef.current.srcObject = localStream;
     }
   }, [localStream]);
+
+  // Auto-load the first sample video (test.mp4) when in file mode without a
+  // stream. Without this, freshly added source nodes — or nodes loaded after
+  // the global useVideoSource fallback was cleared (e.g. switching to
+  // Spout/NDI/Syphon globally) — would show "No video loaded" until the user
+  // manually clicked the cycle button. The init handler is idempotent.
+  useEffect(() => {
+    if (sourceMode === "video" && !localStream && onInitSampleVideo) {
+      onInitSampleVideo();
+    }
+  }, [sourceMode, localStream, onInitSampleVideo]);
 
   // Discover NDI sources
   useEffect(() => {
@@ -143,6 +154,12 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
     onSyphonSourceChange?.(identifier);
   };
 
+  const handleSyphonFlipVerticalChange = (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    updateData({ sourceFlipVertical: e.target.checked });
+  };
+
   const handleFileClick = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
@@ -179,7 +196,7 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
   }));
 
   return (
-    <NodeCard selected={selected} collapsed={collapsed}>
+    <NodeCard selected={selected} collapsed={collapsed} autoMinHeight={false}>
       <NodeHeader
         title={data.customTitle || "Source"}
         onTitleChange={newTitle => updateData({ customTitle: newTitle })}
@@ -189,7 +206,7 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
       {!collapsed && (
         <div className="px-2 py-1.5 flex flex-col gap-1.5 flex-1 min-h-0">
           <div className="px-2">
-            <NodeParamRow label="Source">
+            <NodeParamRow label="Source" className="justify-start gap-2">
               <NodePillSelect
                 value={sourceMode}
                 onChange={handleSourceModeChange}
@@ -256,7 +273,7 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
 
           {sourceMode === "syphon" && (
             <div className="px-2 flex flex-col gap-1.5">
-              <NodeParamRow label="Source">
+              <NodeParamRow label="Source" className="justify-start gap-2">
                 <div className="flex items-center gap-1">
                   <NodePillSearchableSelect
                     value={sourceName}
@@ -293,6 +310,20 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
                   </button>
                 </div>
               </NodeParamRow>
+              <NodeParamRow label="Flip Y" className="justify-start gap-2">
+                <label className="flex items-center gap-2 text-[10px] text-[#fafafa]">
+                  <input
+                    type="checkbox"
+                    checked={sourceFlipVertical}
+                    onChange={handleSyphonFlipVerticalChange}
+                    className="h-3 w-3 accent-white"
+                    disabled={data.isStreaming === true}
+                  />
+                  <span className="text-left text-[#8c8c8d]">
+                    Fix flipped inputs
+                  </span>
+                </label>
+              </NodeParamRow>
             </div>
           )}
 
@@ -318,7 +349,6 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
                   <button
                     type="button"
                     onClick={() => onCycleSampleVideo?.()}
-                    disabled={isStreaming}
                     className="w-5 h-5 flex items-center justify-center bg-[#2a2a2a]/80 hover:bg-[#2a2a2a] text-[#fafafa] rounded border border-[rgba(119,119,119,0.35)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     title="Cycle sample video"
                   >
@@ -340,7 +370,6 @@ export function SourceNode({ id, data, selected }: NodeProps<SourceNodeType>) {
                   <button
                     type="button"
                     onClick={handleFileClick}
-                    disabled={isStreaming}
                     className="w-5 h-5 flex items-center justify-center bg-[#2a2a2a]/80 hover:bg-[#2a2a2a] text-[#fafafa] rounded border border-[rgba(119,119,119,0.35)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     title="Upload video file"
                   >

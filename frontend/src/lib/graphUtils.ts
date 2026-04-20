@@ -27,6 +27,7 @@ export interface ParameterPortDef {
   label?: string;
   min?: number;
   max?: number;
+  step?: number;
   enum?: unknown[];
   isLoadParam?: boolean;
 }
@@ -102,7 +103,8 @@ export interface FlowNodeData {
     | "tempo"
     | "prompt_list"
     | "prompt_blend"
-    | "scheduler";
+    | "scheduler"
+    | "audio";
   availablePipelineIds?: string[];
   /** Declared input ports for the selected pipeline */
   streamInputs?: string[];
@@ -118,6 +120,10 @@ export interface FlowNodeData {
   valueType?: "string" | "number" | "boolean" | "trigger";
   /** For primitive / slider nodes: the current value */
   value?: unknown;
+  /** For primitive nodes: whether value changes are sent immediately (default: true) */
+  primitiveAutoSend?: boolean;
+  /** For primitive nodes: the last explicitly committed/sent value (runtime-only, used when autoSend is off) */
+  committedValue?: unknown;
   /** For control nodes: the type of control (float, int, string) */
   controlType?: "float" | "int" | "string";
   /** For string control nodes: animated (pattern cycling) or switch (input-selected) */
@@ -172,6 +178,8 @@ export interface FlowNodeData {
   sourceMode?: "video" | "camera" | "spout" | "ndi" | "syphon";
   /** For source nodes: source name/identifier for Spout/NDI (sender name for Spout, identifier for NDI) */
   sourceName?: string;
+  /** For source nodes: whether incoming Syphon frames should be flipped vertically */
+  sourceFlipVertical?: boolean;
   /** For source nodes: local video preview stream (camera or file) */
   localStream?: MediaStream | null;
   /** For source nodes: callback to upload a video file */
@@ -192,8 +200,12 @@ export interface FlowNodeData {
   onSyphonSourceChange?: (identifier: string) => void;
   /** For source nodes: callback to cycle through sample videos */
   onCycleSampleVideo?: () => void;
+  /** For source nodes: callback to initialize the first sample video (test.mp4) */
+  onInitSampleVideo?: () => void;
   /** For sink nodes: remote output stream */
   remoteStream?: MediaStream | null;
+  /** For sink nodes: per-sink WebRTC stats (FPS, bitrate) */
+  sinkStats?: { fps: number; bitrate: number };
   /** For pipeline nodes: whether the selected pipeline supports prompts */
   supportsPrompts?: boolean;
   /** For pipeline nodes: whether the selected pipeline supports cache management (shows Reset Cache button) */
@@ -208,9 +220,9 @@ export interface FlowNodeData {
   isStreaming?: boolean;
 
   /* ── Record node fields ── */
-  /** For record nodes: callback to start recording */
+  /** For record nodes: callback to start recording (node_id is bound by enrichment) */
   onStartRecording?: () => void;
-  /** For record nodes: callback to stop recording */
+  /** For record nodes: callback to stop recording (node_id is bound by enrichment) */
   onStopRecording?: () => void;
   /** For record nodes: incoming trigger value from connected nodes */
   triggerValue?: boolean;
@@ -248,6 +260,10 @@ export interface FlowNodeData {
   tupleEnforceOrder?: boolean;
   /** For tuple nodes: ordering direction */
   tupleOrderDirection?: "asc" | "desc";
+
+  /* ── Audio node fields ── */
+  /** For audio nodes: the selected audio asset path */
+  audioPath?: string;
 
   /* ── Image / Media node fields ── */
   /** For image/media nodes: the selected asset path (image or video) */
@@ -442,10 +458,12 @@ export function extractParameterPorts(
 
     // Skip complex component fields that get special handling in the node
     // (e.g. manage_cache has component "cache" and is replaced by a Reset Cache button,
-    //  vace_context_scale has component "vace" and is handled by the VACE node)
+    //  vace_context_scale has component "vace" and is handled by the VACE node,
+    //  lora_merge_strategy has component "lora" and is handled by the LoRA node)
     if (
       schemaProp.ui.component === "cache" ||
-      schemaProp.ui.component === "vace"
+      schemaProp.ui.component === "vace" ||
+      schemaProp.ui.component === "lora"
     )
       continue;
 
@@ -538,6 +556,16 @@ export function extractParameterPorts(
 
     if (!paramType) continue;
 
+    // Detect integer type from schema (direct type or non-null anyOf variant)
+    const isInteger =
+      schemaProp.type === "integer" ||
+      (anyOf?.some(
+        v =>
+          (v as Record<string, unknown>).type === "integer" &&
+          (v as Record<string, unknown>).type !== "null"
+      ) ??
+        false);
+
     const ui = schemaProp.ui;
     const label = ui?.label || key;
     const baseEnumValues = Array.isArray(schemaProp.enum)
@@ -551,15 +579,34 @@ export function extractParameterPorts(
     const enumValues =
       baseEnumValues && isNullable ? [null, ...baseEnumValues] : baseEnumValues;
 
+    // For nullable numbers, pull min/max from the non-null anyOf variant
+    let minimum = schemaProp.minimum;
+    let maximum = schemaProp.maximum;
+    if (minimum === undefined || maximum === undefined) {
+      if (anyOf?.length) {
+        const numVariant = anyOf.find(
+          v =>
+            ((v as Record<string, unknown>).type === "integer" ||
+              (v as Record<string, unknown>).type === "number") &&
+            (v as Record<string, unknown>).type !== "null"
+        ) as Record<string, unknown> | undefined;
+        if (numVariant) {
+          if (minimum === undefined && typeof numVariant.minimum === "number")
+            minimum = numVariant.minimum;
+          if (maximum === undefined && typeof numVariant.maximum === "number")
+            maximum = numVariant.maximum;
+        }
+      }
+    }
+
     params.push({
       name: key,
       type: paramType,
       defaultValue: schemaProp.default,
       label,
-      min:
-        typeof schemaProp.minimum === "number" ? schemaProp.minimum : undefined,
-      max:
-        typeof schemaProp.maximum === "number" ? schemaProp.maximum : undefined,
+      min: typeof minimum === "number" ? minimum : undefined,
+      max: typeof maximum === "number" ? maximum : undefined,
+      step: paramType === "number" && isInteger ? 1 : undefined,
       enum: enumValues,
       isLoadParam: ui?.is_load_param,
     });
@@ -614,8 +661,13 @@ export function graphConfigToFlow(
   const pipelines = graph.nodes.filter(
     n => n.type === "pipeline" && !isSubgraphInnerNode(n.id)
   );
+  // Separate regular sinks from output-sink nodes (sink_mode set).
+  // Output-sink nodes are restored from ui_state as OutputNodes.
+  const outputSinkNodes = graph.nodes.filter(
+    n => n.type === "sink" && !isSubgraphInnerNode(n.id) && n.sink_mode
+  );
   const sinks = graph.nodes.filter(
-    n => n.type === "sink" && !isSubgraphInnerNode(n.id)
+    n => n.type === "sink" && !isSubgraphInnerNode(n.id) && !n.sink_mode
   );
 
   const nodes: Node<FlowNodeData>[] = [];
@@ -649,6 +701,7 @@ export function graphConfigToFlow(
             | "syphon"
             | undefined) ?? "video",
         sourceName: n.source_name ?? undefined,
+        sourceFlipVertical: n.source_flip_vertical ?? false,
       },
     });
   });
@@ -706,6 +759,29 @@ export function graphConfigToFlow(
     });
   });
 
+  const records = graph.nodes.filter(
+    n => n.type === "record" && !isSubgraphInnerNode(n.id)
+  );
+  records.forEach((n, i) => {
+    const savedX = n.x ?? undefined;
+    const savedY = n.y ?? undefined;
+    const w = n.w ?? 180;
+    const h = n.h ?? 95;
+    nodes.push({
+      id: n.id,
+      type: "record",
+      position: {
+        x: savedX !== undefined ? savedX : START_X + COLUMN_GAP * 3,
+        y:
+          savedY !== undefined ? savedY : START_Y + i * (NODE_HEIGHT + ROW_GAP),
+      },
+      width: w,
+      height: h,
+      style: { width: w, height: h },
+      data: { label: n.id, nodeType: "record" },
+    });
+  });
+
   // Convert edges - add stream: prefix to handle IDs
   // Skip edges that reference flattened inner subgraph nodes
   const edges: Edge[] = graph.edges
@@ -740,6 +816,9 @@ export function graphConfigToFlow(
     for (const un of uiNodes) {
       // Migrate old "value" nodes to "primitive"
       const nodeType = un.type === "value" ? "primitive" : un.type;
+      if (nodeType === "record") {
+        continue;
+      }
       const nodeData = un.data as FlowNodeData;
       if (un.type === "value") {
         nodeData.nodeType = "primitive";
@@ -796,6 +875,29 @@ export function graphConfigToFlow(
     }
   }
 
+  // Fallback: create OutputNodes for sink_mode nodes not restored from ui_state
+  const restoredIds = new Set(nodes.map(n => n.id));
+  for (const n of outputSinkNodes) {
+    if (restoredIds.has(n.id)) continue;
+    const savedX = n.x ?? undefined;
+    const savedY = n.y ?? undefined;
+    nodes.push({
+      id: n.id,
+      type: "output",
+      position: {
+        x: savedX !== undefined ? savedX : START_X + COLUMN_GAP * 2 + 300,
+        y: savedY !== undefined ? savedY : START_Y,
+      },
+      data: {
+        label: n.sink_name || "Output",
+        nodeType: "output",
+        outputSinkType: n.sink_mode ?? "spout",
+        outputSinkEnabled: true,
+        outputSinkName: n.sink_name ?? "",
+      },
+    });
+  }
+
   return { nodes, edges };
 }
 
@@ -812,6 +914,7 @@ const FRONTEND_ONLY_TYPES = new Set<FlowNodeData["nodeType"]>([
   "tuple",
   "reroute",
   "image",
+  "audio",
   "vace",
   "lora",
   "midi",
@@ -820,7 +923,6 @@ const FRONTEND_ONLY_TYPES = new Set<FlowNodeData["nodeType"]>([
   "subgraph",
   "subgraph_input",
   "subgraph_output",
-  "record",
   "tempo",
   "prompt_list",
   "prompt_blend",
@@ -831,6 +933,7 @@ const FRONTEND_ONLY_TYPES = new Set<FlowNodeData["nodeType"]>([
 const NON_SERIALIZABLE_KEYS = new Set<string>([
   "localStream",
   "remoteStream",
+  "sinkStats",
   "onVideoFileUpload",
   "onSourceModeChange",
   "onSpoutSourceChange",
@@ -851,6 +954,7 @@ const NON_SERIALIZABLE_KEYS = new Set<string>([
   "onSetTempo",
   "onRefreshTempoSources",
   "tempoSources",
+  "committedValue",
 ]);
 
 /**
@@ -1105,7 +1209,9 @@ export function flowToGraphConfig(
           ? "source"
           : n.data.nodeType === "sink"
             ? "sink"
-            : "pipeline",
+            : n.data.nodeType === "record"
+              ? "record"
+              : "pipeline",
       pipeline_id:
         n.data.nodeType === "pipeline"
           ? (n.data.pipelineId ?? null)
@@ -1118,9 +1224,44 @@ export function flowToGraphConfig(
         n.data.nodeType === "source" ? (n.data.sourceMode ?? null) : undefined,
       source_name:
         n.data.nodeType === "source" ? (n.data.sourceName ?? null) : undefined,
+      source_flip_vertical:
+        n.data.nodeType === "source"
+          ? Boolean(n.data.sourceFlipVertical)
+          : undefined,
       tempo_sync: tempoConnectedPipelineIds.has(n.id) || undefined,
     };
   });
+
+  // Convert enabled OutputNodes to backend sink nodes with sink_mode/sink_name.
+  // This allows the backend's multi-sink system to create per-node Syphon/Spout/NDI
+  // senders, each receiving frames from the specific pipeline they're connected to.
+  for (const n of flatNodes) {
+    if (n.data.nodeType !== "output") continue;
+    const enabled = (n.data.outputSinkEnabled as boolean) ?? false;
+    if (!enabled) continue;
+
+    const sinkType = (n.data.outputSinkType as string) || "spout";
+    const sinkName = (n.data.outputSinkName as string) || "";
+    const ow =
+      n.width ??
+      n.measured?.width ??
+      (typeof n.style?.width === "number" ? n.style.width : undefined);
+    const oh =
+      n.height ??
+      n.measured?.height ??
+      (typeof n.style?.height === "number" ? n.style.height : undefined);
+
+    graphNodes.push({
+      id: n.id,
+      type: "sink",
+      x: n.position.x,
+      y: n.position.y,
+      w: ow && !Number.isNaN(ow) ? ow : undefined,
+      h: oh && !Number.isNaN(oh) ? oh : undefined,
+      sink_mode: sinkType,
+      sink_name: sinkName,
+    });
+  }
 
   // Filter edges to only include those where both source and target exist in graphNodes
   const graphNodeIds = new Set(graphNodes.map(n => n.id));
@@ -1182,10 +1323,13 @@ export function flowToGraphConfig(
         };
       });
 
-    // Edges that touch at least one frontend-only node (and aren't already in graphEdges)
+    // Edges that touch at least one frontend-only node but aren't already
+    // in graphEdges (both endpoints in graphNodeIds means it's a backend edge)
     const uiEdges: UIStateEdge[] = edges
       .filter(
-        e => frontendNodeIds.has(e.source) || frontendNodeIds.has(e.target)
+        e =>
+          (frontendNodeIds.has(e.source) || frontendNodeIds.has(e.target)) &&
+          !(graphNodeIds.has(e.source) && graphNodeIds.has(e.target))
       )
       .map(e => ({
         id: e.id,
@@ -1276,9 +1420,49 @@ export function linearGraphFromSettings(
 }
 
 /**
- * Strip frontend-only fields (position, size, ui_state) from a GraphConfig
- * before sending to the backend. The backend only needs node identity/type,
- * edges, and source config — not layout or UI state.
+ * Perform mode sends a linear graph whose default source is WebRTC (`video`).
+ * When the user selects Spout, NDI, or Syphon, `input_source` is also set, but
+ * the backend drops `input_source` whenever the session includes any graph
+ * source node — hardware capture is wired only from per-node `source_mode` /
+ * `source_name` (see FrameProcessor.start). Patch the linear graph's `input`
+ * node so multi-source setup matches Workflow Builder.
+ */
+export function applyHardwareInputSourceToLinearGraph(
+  graph: GraphConfig,
+  inputSource?: {
+    enabled: boolean;
+    source_type: string;
+    source_name: string;
+    flip_vertical?: boolean;
+  }
+): GraphConfig {
+  const t = inputSource?.source_type;
+  if (
+    !inputSource?.enabled ||
+    (t !== "ndi" && t !== "spout" && t !== "syphon")
+  ) {
+    return graph;
+  }
+  return {
+    ...graph,
+    nodes: graph.nodes.map(n =>
+      n.id === "input" && n.type === "source"
+        ? {
+            ...n,
+            source_mode: t,
+            source_name: inputSource.source_name ?? "",
+            source_flip_vertical:
+              t === "syphon" ? Boolean(inputSource.flip_vertical) : false,
+          }
+        : n
+    ),
+  };
+}
+
+/**
+ * Drop layout fields (x, y, w, h) and omit `ui_state` from the payload to the
+ * server. Execution topology — including `type: "record"` nodes and their
+ * edges — stays in `nodes` / `edges`; record nodes are not frontend-only.
  */
 export function stripUIFields(graph: GraphConfig): GraphConfig {
   return {
@@ -1301,6 +1485,11 @@ const VACE_PORTS = ["vace_input_frames", "vace_input_masks"];
  * vace_input_frames + vace_input_masks), the topology fans out so the source
  * feeds both the preprocessor and the main pipeline, and the preprocessor
  * connects to the main pipeline via its VACE ports.
+ *
+ * When `vace_enabled` is true on a pipeline, a graph `vace` node is added and
+ * connected via `param:__vace`. An empty `image` (Media) node is placed to the
+ * left and wired to `ref_image` with no path; workflow `vace_ref_images` stay
+ * in pipeline `node_params` for runtime.
  */
 export function workflowToGraphConfig(
   workflow: {
@@ -1516,6 +1705,79 @@ export function workflowToGraphConfig(
         sourceHandle: buildHandleId("param", "__loras"),
         target: nodeId,
         targetHandle: buildHandleId("param", "__loras"),
+      });
+    }
+
+    // VACE compound node: matches graph-native workflows so the pipeline shows
+    // "VACE: Connected" and getGraphVaceSettings() can supply ref/context.
+    if (wp.params?.vace_enabled === true) {
+      const refImageNodeId = generateNodeId("ref-image", usedIds);
+      usedIds.add(refImageNodeId);
+
+      const vaceNodeId = generateNodeId("vace", usedIds);
+      usedIds.add(vaceNodeId);
+
+      const vaceContextScale =
+        typeof wp.params.vace_context_scale === "number"
+          ? wp.params.vace_context_scale
+          : 1.0;
+
+      const vaceY =
+        wp.loras && wp.loras.length > 0 ? meta.y - 360 : meta.y - 160;
+
+      // Empty Media node (Ref Image slot); paths remain in pipeline node_params only.
+      uiNodes.push({
+        id: refImageNodeId,
+        type: "image",
+        position: { x: meta.x - 420, y: vaceY },
+        width: 160,
+        height: 140,
+        data: {
+          label: "Ref Image",
+          customTitle: "Ref Image",
+          nodeType: "image",
+          imagePath: "",
+          mediaType: "image",
+          parameterOutputs: [
+            { name: "value", type: "string", defaultValue: "" },
+          ],
+        } as FlowNodeData,
+      });
+
+      uiNodes.push({
+        id: vaceNodeId,
+        type: "vace",
+        position: { x: meta.x - 180, y: vaceY },
+        width: 240,
+        height: 178,
+        data: {
+          label: "VACE",
+          nodeType: "vace",
+          vaceContextScale,
+          vaceRefImage: "",
+          vaceFirstFrame: "",
+          vaceLastFrame: "",
+          vaceVideo: "",
+          parameterOutputs: [
+            { name: "__vace", type: "string", defaultValue: "" },
+          ],
+        } as FlowNodeData,
+      });
+
+      uiEdges.push({
+        id: `e-${refImageNodeId}-${vaceNodeId}-ref`,
+        source: refImageNodeId,
+        sourceHandle: buildHandleId("param", "value"),
+        target: vaceNodeId,
+        targetHandle: buildHandleId("param", "ref_image"),
+      });
+
+      uiEdges.push({
+        id: `e-${vaceNodeId}-${nodeId}`,
+        source: vaceNodeId,
+        sourceHandle: buildHandleId("param", "__vace"),
+        target: nodeId,
+        targetHandle: buildHandleId("param", "__vace"),
       });
     }
   }

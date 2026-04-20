@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .media_packets import ensure_video_packet
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,6 +19,7 @@ logger = logging.getLogger(__name__)
 class _RecordingEntry:
     manager: object  # RecordingManager
     track: object  # QueueVideoTrack
+    stopped_file: str | None = None  # File path after stop (before download)
 
 
 class RecordingCoordinator:
@@ -70,13 +73,29 @@ class RecordingCoordinator:
         """Return the list of record node IDs."""
         return list(self._record_queues.keys())
 
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> int:
+        """Drop all currently buffered items and return the count removed.
+
+        Record queues are live as soon as the graph starts, so they may already
+        contain stale frames by the time recording begins. Starting from stale
+        backlog skews content-vs-duration checks and can hide timing bugs.
+        """
+        dropped = 0
+        while True:
+            try:
+                q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                return dropped
+
     def get(self, record_node_id: str) -> torch.Tensor | None:
         """Read a frame from a record node's output queue."""
         rec_q = self._record_queues.get(record_node_id)
         if rec_q is None:
             return None
         try:
-            frame = rec_q.get_nowait()
+            frame = ensure_video_packet(rec_q.get_nowait()).tensor
             frame = frame.squeeze(0)
             if frame.is_cuda:
                 frame = frame.cpu()
@@ -120,6 +139,14 @@ class RecordingCoordinator:
                 logger.info(f"Record node {node_id} already recording")
                 return True
 
+        dropped = self._drain_queue(rec_q)
+        if dropped > 0:
+            logger.info(
+                "Dropped %d stale frame(s) from record queue %s before start",
+                dropped,
+                node_id,
+            )
+
         from .recording import RecordingManager
         from .tracks import QueueVideoTrack
 
@@ -137,15 +164,38 @@ class RecordingCoordinator:
         entry = self._entries.get(node_id)
         if entry is None:
             return False
+        # Save the recording file path before stop clears it
+        entry.stopped_file = entry.manager.recording_file
         await entry.manager.stop_recording()
         logger.info(f"Stopped recording for record node {node_id}")
         return True
 
     async def download_recording(self, node_id: str) -> str | None:
         """Finalize and return the recording file path for a record node."""
+        import os
+        import shutil
+        import tempfile
+
         entry = self._entries.get(node_id)
         if entry is None:
             return None
+
+        # Try finalize first (if recording is still active)
         path = await entry.manager.finalize_and_get_recording(restart_after=False)
+
+        # Fall back to the stopped file path
+        if not path and entry.stopped_file and os.path.exists(entry.stopped_file):
+            # Copy to a download file
+            fd, download_path = tempfile.mkstemp(
+                suffix=".mp4", prefix="scope_download_"
+            )
+            os.close(fd)
+            shutil.copy2(entry.stopped_file, download_path)
+            try:
+                os.remove(entry.stopped_file)
+            except Exception as e:
+                logger.warning(f"Failed to remove recording file: {e}")
+            path = download_path
+
         self._entries.pop(node_id, None)
         return path

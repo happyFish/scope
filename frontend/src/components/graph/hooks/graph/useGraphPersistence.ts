@@ -161,11 +161,24 @@ export function useGraphPersistence({
         setEdges(colorEdges(flowEdges, enriched, handleEdgeDelete));
         setStatus("Restored from local storage");
 
-        const sourceNode = flowNodes.find(n => n.data.nodeType === "source");
-        const restoredMode = sourceNode?.data.sourceMode as string | undefined;
-        if (restoredMode && restoredMode !== "video") {
+        const sourceNodes = flowNodes.filter(n => n.data.nodeType === "source");
+        const modesToRestore = sourceNodes
+          .map(n => ({
+            mode: n.data.sourceMode as string | undefined,
+            nodeId: n.id,
+          }))
+          .filter(
+            (entry): entry is { mode: string; nodeId: string } =>
+              !!entry.mode && entry.mode !== "video"
+          );
+        if (modesToRestore.length > 0) {
           setTimeout(() => {
-            enrichDepsRef.current.onSourceModeChangeRef.current?.(restoredMode);
+            for (const { mode, nodeId } of modesToRestore) {
+              enrichDepsRef.current.onSourceModeChangeRef.current?.(
+                mode,
+                nodeId
+              );
+            }
           }, 0);
         }
 
@@ -338,11 +351,27 @@ export function useGraphPersistence({
       setStatus(`Imported from ${fileName}`);
       setFitViewTrigger(c => c + 1);
 
-      const sourceNode = flowNodes.find(n => n.data.nodeType === "source");
-      const importedMode = sourceNode?.data.sourceMode as string | undefined;
-      if (importedMode) {
+      // Restore non-default source modes that need external setup
+      // (camera permission, Spout/NDI/Syphon hardware connection). File mode
+      // ("video") is the default and is handled by SourceNode's auto-init
+      // effect — re-dispatching it here would race with and cancel the init
+      // since handlePerNodeSourceModeChange unconditionally stops any existing
+      // stream for the node.
+      const sourceNodes = flowNodes.filter(n => n.data.nodeType === "source");
+      const modesToRestore = sourceNodes
+        .map(n => ({
+          mode: n.data.sourceMode as string | undefined,
+          nodeId: n.id,
+        }))
+        .filter(
+          (entry): entry is { mode: string; nodeId: string } =>
+            !!entry.mode && entry.mode !== "video"
+        );
+      if (modesToRestore.length > 0) {
         setTimeout(() => {
-          enrichDepsRef.current.onSourceModeChangeRef.current?.(importedMode);
+          for (const { mode, nodeId } of modesToRestore) {
+            enrichDepsRef.current.onSourceModeChangeRef.current?.(mode, nodeId);
+          }
         }, 0);
       }
     },
@@ -503,9 +532,29 @@ export function useGraphPersistence({
       nodesRef.current,
       edgesRef.current
     );
+    // Merge parameterValues from node data (graph connections written by the
+    // RAF loop in useValueForwarding) with nodeParams (manual edits).  Manual
+    // edits take precedence so explicit user changes aren't overwritten.
+    const mergedParams: Record<string, Record<string, unknown>> = {};
+    for (const node of root.nodes) {
+      if (node.data.nodeType !== "pipeline") continue;
+      const fromData =
+        (node.data.parameterValues as Record<string, unknown>) ?? {};
+      const fromState = nodeParamsRef.current[node.id] ?? {};
+      const merged = { ...fromData, ...fromState };
+      if (Object.keys(merged).length > 0) {
+        mergedParams[node.id] = merged;
+      }
+    }
+    // Preserve non-pipeline node params from nodeParamsRef
+    for (const [nodeId, bag] of Object.entries(nodeParamsRef.current)) {
+      if (!mergedParams[nodeId]) {
+        mergedParams[nodeId] = bag;
+      }
+    }
     return attachNodeParams(
       flowToGraphConfig(root.nodes, root.edges),
-      nodeParamsRef.current
+      mergedParams
     );
   }, [nodeParamsRef, resolveRootGraphRef]);
 

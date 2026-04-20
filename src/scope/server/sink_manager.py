@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from .media_packets import VideoPacket, ensure_video_packet
 from .recording_coordinator import RecordingCoordinator
 
 if TYPE_CHECKING:
@@ -84,20 +85,27 @@ class SinkManager:
     # Sink queue routing
     # ------------------------------------------------------------------
 
-    def get_from_sink(self, sink_node_id: str) -> torch.Tensor | None:
-        """Read a frame from a specific sink node's output queue (multi-sink)."""
+    def get_packet_from_sink(self, sink_node_id: str) -> VideoPacket | None:
+        """Read a packet from a specific sink node's output queue (multi-sink)."""
         sink_q = self._sink_queues_by_node.get(sink_node_id)
         if sink_q is None:
             return None
 
         try:
-            frame = sink_q.get_nowait()
-            frame = frame.squeeze(0)
+            packet = ensure_video_packet(sink_q.get_nowait())
+            frame = packet.tensor.squeeze(0)
             if frame.is_cuda:
                 frame = frame.cpu()
-            return frame
+            return VideoPacket(tensor=frame, timestamp=packet.timestamp)
         except queue.Empty:
             return None
+
+    def get_from_sink(self, sink_node_id: str) -> torch.Tensor | None:
+        """Backwards-compatible tensor getter for sink output."""
+        packet = self.get_packet_from_sink(sink_node_id)
+        if packet is None:
+            return None
+        return packet.tensor
 
     def get_sink_node_ids(self) -> list[str]:
         """Return the list of sink node IDs available for reading."""
@@ -123,6 +131,20 @@ class SinkManager:
         if proc is not None:
             return proc.get_fps()
         return None
+
+    def get_sink_queue_maxsize(self, sink_node_id: str) -> int | None:
+        """Return current queue capacity for a sink node."""
+        sink_q = self._sink_queues_by_node.get(sink_node_id)
+        if sink_q is None:
+            return None
+        return sink_q.maxsize
+
+    def get_record_queue_maxsize(self, record_node_id: str) -> int | None:
+        """Return current queue capacity for a record node."""
+        rec_q = self._recording._record_queues.get(record_node_id)
+        if rec_q is None:
+            return None
+        return rec_q.maxsize
 
     # ------------------------------------------------------------------
     # Generic output sinks info
@@ -382,12 +404,12 @@ class SinkManager:
         while self._running and node_id in self._sinks_by_node:
             try:
                 try:
-                    frame = sink_q.get(timeout=0.1)
+                    packet = ensure_video_packet(sink_q.get(timeout=0.1))
                 except queue.Empty:
                     continue
 
                 # Convert tensor to numpy for the output sink
-                frame_squeezed = frame.squeeze(0)
+                frame_squeezed = packet.tensor.squeeze(0)
                 if frame_squeezed.is_cuda:
                     frame_squeezed = frame_squeezed.cpu()
                 frame_np = frame_squeezed.numpy()
@@ -414,17 +436,35 @@ class SinkManager:
     # Recording
     # ------------------------------------------------------------------
 
+    def get_from_record(self, record_node_id: str):
+        """Read a frame from a record node's output queue."""
+        return self._recording.get(record_node_id)
+
+    def put_to_record(self, node_id: str, frame) -> None:
+        """Convert a VideoFrame to tensor and put it into a record node's queue."""
+        import torch
+
+        rec_q = self._recording._record_queues.get(node_id)
+        if rec_q is None:
+            return
+        try:
+            frame_np = frame.to_ndarray(format="rgb24")
+            t = torch.as_tensor(frame_np, dtype=torch.uint8).unsqueeze(0)
+            try:
+                rec_q.put_nowait(t)
+            except queue.Full:
+                try:
+                    rec_q.get_nowait()
+                    rec_q.put_nowait(t)
+                except queue.Empty:
+                    pass
+        except Exception as e:
+            logger.error(f"Error in put_to_record for node {node_id}: {e}")
+
     @property
     def recording(self) -> RecordingCoordinator:
         """Access the recording coordinator for record-node operations."""
         return self._recording
-
-    def put_to_record(self, record_node_id: str, frame) -> bool:
-        """Write a frame into a record node's queue (cloud mode).
-
-        Delegates to RecordingCoordinator.put().
-        """
-        return self._recording.put(record_node_id, frame)
 
     def setup_cloud_graph(self, graph: Any) -> None:
         """Set up record queues from a graph config (cloud mode).

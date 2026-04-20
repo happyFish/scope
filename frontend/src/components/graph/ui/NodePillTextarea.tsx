@@ -51,12 +51,12 @@ export function NodePillTextarea({
       ref={textareaRef}
       value={value}
       onChange={handleChange}
-      onKeyDown={handleKeyDown}
+      onKeyDown={onSubmit ? handleKeyDown : undefined}
       onWheel={handleWheel}
       disabled={disabled}
       placeholder={placeholder}
       rows={3}
-      className={`${NODE_TOKENS.pillInput} !rounded-md w-full min-w-[110px] resize-y min-h-[60px] max-h-full overflow-y-auto text-left py-1.5 leading-relaxed nowheel nodrag ${className}`}
+      className={`${NODE_TOKENS.pillInput} w-full min-w-[110px] resize-y min-h-[60px] max-h-full overflow-y-auto text-left py-1.5 leading-relaxed nowheel nodrag [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-white/30 ${className}`}
     />
   );
 }

@@ -341,9 +341,15 @@ export const getInputSourceResolution = async (
 export const getInputSourceStreamUrl = (
   sourceType: string,
   identifier: string,
-  fps = 2
-): string =>
-  `/api/v1/input-sources/${sourceType}/sources/${encodeURIComponent(identifier)}/stream?fps=${fps}`;
+  fps = 2,
+  options?: { flipVertical?: boolean }
+): string => {
+  const params = new URLSearchParams({ fps: String(fps) });
+  if (options?.flipVertical) {
+    params.set("flip_vertical", "true");
+  }
+  return `/api/v1/input-sources/${sourceType}/sources/${encodeURIComponent(identifier)}/stream?${params.toString()}`;
+};
 
 export const fetchCurrentLogs = async (): Promise<string> => {
   const response = await fetch("/api/v1/logs/current", {
@@ -453,7 +459,7 @@ export interface AssetFileInfo {
   path: string;
   size_mb: number;
   folder?: string | null;
-  type: string; // "image" or "video"
+  type: string; // "image", "video", or "audio"
   created_at: number; // Unix timestamp
 }
 
@@ -462,7 +468,7 @@ export interface AssetsResponse {
 }
 
 export const listAssets = async (
-  type?: "image" | "video"
+  type?: "image" | "video" | "audio"
 ): Promise<AssetsResponse> => {
   const url = type ? `/api/v1/assets?type=${type}` : "/api/v1/assets";
   const response = await fetch(url, {
@@ -907,7 +913,7 @@ export const deleteApiKey = async (
 
 export interface GraphNode {
   id: string;
-  type: "source" | "pipeline" | "sink";
+  type: "source" | "pipeline" | "sink" | "record";
   pipeline_id?: string | null;
   x?: number | null;
   y?: number | null;
@@ -915,7 +921,10 @@ export interface GraphNode {
   h?: number | null;
   source_mode?: string | null;
   source_name?: string | null;
+  source_flip_vertical?: boolean;
   tempo_sync?: boolean;
+  sink_mode?: string | null;
+  sink_name?: string | null;
 }
 
 export interface GraphEdge {
@@ -933,12 +942,16 @@ export interface GraphConfig {
   ui_state?: Record<string, unknown> | null;
 }
 
-export const downloadRecording = async (sessionId: string): Promise<void> => {
+export const downloadRecording = async (
+  sessionId: string,
+  nodeId?: string
+): Promise<void> => {
   if (!sessionId) {
     throw new Error("Session ID is required to download recording");
   }
 
-  const response = await fetch(`/api/v1/recordings/${sessionId}`, {
+  const params = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  const response = await fetch(`/api/v1/recordings/${sessionId}${params}`, {
     method: "GET",
   });
 
@@ -954,7 +967,8 @@ export const downloadRecording = async (sessionId: string): Promise<void> => {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `recording-${new Date().toISOString().split("T")[0]}.mp4`;
+  const suffix = nodeId ? `-${nodeId}` : "";
+  link.download = `recording${suffix}-${new Date().toISOString().split("T")[0]}.mp4`;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
@@ -962,11 +976,16 @@ export const downloadRecording = async (sessionId: string): Promise<void> => {
 };
 
 export const startRecording = async (
-  sessionId: string
+  sessionId: string,
+  nodeId?: string
 ): Promise<{ status: string }> => {
-  const response = await fetch(`/api/v1/recordings/${sessionId}/start`, {
-    method: "POST",
-  });
+  const params = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  const response = await fetch(
+    `/api/v1/recordings/${sessionId}/start${params}`,
+    {
+      method: "POST",
+    }
+  );
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Start recording failed: ${response.status}: ${errorText}`);
@@ -975,11 +994,16 @@ export const startRecording = async (
 };
 
 export const stopRecording = async (
-  sessionId: string
+  sessionId: string,
+  nodeId?: string
 ): Promise<{ status: string }> => {
-  const response = await fetch(`/api/v1/recordings/${sessionId}/stop`, {
-    method: "POST",
-  });
+  const params = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : "";
+  const response = await fetch(
+    `/api/v1/recordings/${sessionId}/stop${params}`,
+    {
+      method: "POST",
+    }
+  );
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Stop recording failed: ${response.status}: ${errorText}`);

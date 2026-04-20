@@ -8,7 +8,8 @@ import {
 } from "../../utils/subgraphSerialization";
 import { buildEdgeStyle } from "../../constants";
 import type { Blueprint } from "../../../../data/blueprints/types";
-import { toast } from "sonner";
+import { resetAutoHeightNodes } from "../../utils/nodeEnrichment";
+
 import type { EnrichNodesDeps } from "../graph/useGraphPersistence";
 import { enrichNodes } from "../graph/useGraphPersistence";
 
@@ -31,6 +32,7 @@ type NodeTypeKey =
   | "tuple"
   | "output"
   | "image"
+  | "audio"
   | "vace"
   | "lora"
   | "midi"
@@ -261,6 +263,18 @@ const NODE_DEFAULTS: Record<NodeTypeKey, NodeDefaults> = {
       nodeType: "image",
       imagePath: "",
       mediaType: "image",
+      parameterOutputs: [{ name: "value", type: "string", defaultValue: "" }],
+    },
+  },
+  audio: {
+    type: "audio",
+    idPrefix: "audio",
+    defaultX: 50,
+    style: { width: 160, height: 100 },
+    data: {
+      label: "Audio",
+      nodeType: "audio",
+      audioPath: "",
       parameterOutputs: [{ name: "value", type: "string", defaultValue: "" }],
     },
   },
@@ -541,6 +555,7 @@ export function useNodeFactories({
         | "tuple"
         | "reroute"
         | "image"
+        | "audio"
         | "vace"
         | "lora"
         | "midi"
@@ -555,32 +570,6 @@ export function useNodeFactories({
       subType?: string
     ) => {
       if (!pendingNodePosition) return;
-
-      // Enforce single source and single sink
-      if (type === "source") {
-        const hasSource = nodes.some(n => n.data.nodeType === "source");
-        if (hasSource) {
-          toast.warning("Only one Source node is allowed");
-          setPendingNodePosition(null);
-          return;
-        }
-      }
-      if (type === "sink") {
-        const hasSink = nodes.some(n => n.data.nodeType === "sink");
-        if (hasSink) {
-          toast.warning("Only one Sink node is allowed");
-          setPendingNodePosition(null);
-          return;
-        }
-      }
-      if (type === "record") {
-        const hasRecord = nodes.some(n => n.data.nodeType === "record");
-        if (hasRecord) {
-          toast.warning("Only one Record node is allowed");
-          setPendingNodePosition(null);
-          return;
-        }
-      }
 
       if (type === "control") {
         if (subType === "float" || subType === "int" || subType === "string") {
@@ -670,7 +659,8 @@ export function useNodeFactories({
       const minY = Math.min(...rawNodes.map(n => n.position.y));
       const targetPos = insertPos ?? { x: 200, y: 200 };
 
-      const newNodes: Node<FlowNodeData>[] = rawNodes.map(node => ({
+      const sizedNodes = resetAutoHeightNodes(rawNodes);
+      const newNodes: Node<FlowNodeData>[] = sizedNodes.map(node => ({
         ...node,
         id: idMap.get(node.id)!,
         position: {

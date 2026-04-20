@@ -14,6 +14,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -23,9 +24,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Type alias for the frame callback: (source_node_id | None, numpy_frame) -> None
+# Type alias for the frame callback:
+# (source_node_id | None, numpy_frame, pts, time_base) -> None
 # source_node_id is None for the generic (non-graph) input source.
-FrameCallback = Callable[[str | None, "np.ndarray"], None]
+FrameCallback = Callable[[str | None, "np.ndarray", int | None, Fraction | None], None]
 
 
 class SourceManager:
@@ -167,25 +169,21 @@ class SourceManager:
         )
 
         if enabled and not self._source_enabled:
-            self._create_and_connect(source_type, source_name)
+            self._create_and_connect(source_type, source_name, config)
 
         elif not enabled and self._source_enabled:
-            self._source_enabled = False
-            if self._source is not None:
-                self._source.close()
-                self._source = None
+            self._stop_primary_source()
             logger.info("Input source disabled")
 
         elif enabled and (
             source_type != self._source_type or config.get("reconnect", False)
         ):
-            self._source_enabled = False
-            if self._source is not None:
-                self._source.close()
-                self._source = None
-            self._create_and_connect(source_type, source_name)
+            self._stop_primary_source()
+            self._create_and_connect(source_type, source_name, config)
 
-    def _create_and_connect(self, source_type: str, source_name: str) -> None:
+    def _create_and_connect(
+        self, source_type: str, source_name: str, config: dict | None = None
+    ) -> None:
         """Create an input source instance and connect to the given source."""
         from scope.core.inputs import get_input_source_classes
 
@@ -207,6 +205,10 @@ class SourceManager:
 
         try:
             self._source = source_class()
+            if source_type == "syphon" and hasattr(self._source, "set_flip_vertical"):
+                self._source.set_flip_vertical(
+                    bool((config or {}).get("flip_vertical", False))
+                )
             if self._source.connect(source_name):
                 self._source_enabled = True
                 self._source_type = source_type
@@ -237,6 +239,36 @@ class SourceManager:
                 except Exception:
                     pass
             self._source = None
+            self._source_thread = None
+
+    def _stop_primary_source(self) -> None:
+        """Stop and clean up the primary input source safely.
+
+        Join the receiver thread before closing the source. If we close
+        PyAV/FFmpeg state while another thread is still inside
+        ``receive_frame()``/decode, teardown can block or wedge in native
+        FFmpeg cleanup/waits.
+
+        "Primary" here means the single non-per-node source stored on
+        ``self._source`` / ``self._source_thread`` (as opposed to entries in
+        ``self._sources_by_node`` for multi-source graph mode).
+        """
+        self._source_enabled = False
+
+        if self._source_thread and self._source_thread.is_alive():
+            self._source_thread.join(timeout=3.0)
+            if self._source_thread.is_alive():
+                logger.warning("Generic input source thread did not stop within 3s")
+        self._source_thread = None
+
+        if self._source is not None:
+            try:
+                self._source.close()
+            except Exception as e:
+                logger.error(f"Error closing input source: {e}")
+            finally:
+                self._source = None
+        self._source_type = ""
 
     def _receiver_loop(
         self,
@@ -274,7 +306,18 @@ class SourceManager:
                 rgb_frame = source.receive_frame(timeout_ms=100)
                 if rgb_frame is not None:
                     if self._on_frame is not None:
-                        self._on_frame(node_id, rgb_frame)
+                        pts: int | None = None
+                        time_base: Fraction | None = None
+                        if isinstance(rgb_frame, tuple) and len(rgb_frame) == 3:
+                            rgb_frame, pts, time_base = rgb_frame
+                            if time_base is not None and not isinstance(
+                                time_base, Fraction
+                            ):
+                                try:
+                                    time_base = Fraction(time_base)
+                                except Exception:
+                                    time_base = None
+                        self._on_frame(node_id, rgb_frame, pts, time_base)
 
                     frame_count += 1
                     if frame_count % 100 == 0:
@@ -327,6 +370,10 @@ class SourceManager:
 
             try:
                 source = source_class()
+                if node.source_mode == "syphon" and hasattr(
+                    source, "set_flip_vertical"
+                ):
+                    source.set_flip_vertical(node.source_flip_vertical)
                 if source.connect(source_name):
                     thread = threading.Thread(
                         target=self._receiver_loop,
@@ -368,13 +415,7 @@ class SourceManager:
         self._running = False
 
         # Generic input source
-        self._source_enabled = False
-        if self._source is not None:
-            try:
-                self._source.close()
-            except Exception as e:
-                logger.error(f"Error closing input source: {e}")
-            self._source = None
+        self._stop_primary_source()
 
         # Per-node input sources: join threads first to avoid closing the
         # source while the thread is still inside receive_frame() (causes

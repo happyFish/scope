@@ -20,7 +20,7 @@ const MODES: {
     icon: Cloud,
     title: "Use Daydream Cloud",
     description: "Use cloud GPU provided by Daydream",
-    detail: "Requires Pro account after free trial",
+    detail: "Requires credits — get started with free credits",
   },
   {
     mode: "local",
@@ -40,7 +40,7 @@ export function InferenceModeStep({ onSelect }: InferenceModeStepProps) {
         <h1 className="text-3xl font-semibold text-foreground">
           Welcome to Daydream Scope
         </h1>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-muted-foreground/70">
           How would you like to proceed?
         </p>
       </div>

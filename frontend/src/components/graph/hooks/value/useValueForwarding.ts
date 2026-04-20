@@ -41,6 +41,7 @@ const PRODUCER_TYPES = new Set<FlowNodeData["nodeType"]>([
   "tuple",
   "reroute",
   "image",
+  "audio",
   "vace",
   "midi",
   "bool",
@@ -136,7 +137,10 @@ export function useValueForwarding(
   onNodeParamChangeRef: React.RefObject<
     ((nodeId: string, key: string, value: unknown) => void) | undefined
   >,
-  setNodes?: React.Dispatch<React.SetStateAction<Node<FlowNodeData>[]>>
+  setNodes?: React.Dispatch<React.SetStateAction<Node<FlowNodeData>[]>>,
+  onPromptForwardRef?: React.RefObject<
+    ((nodeId: string, text: string) => void) | undefined
+  >
 ) {
   const lastForwardTimeRef = useRef<Record<string, number>>({});
 
@@ -147,6 +151,22 @@ export function useValueForwarding(
   // duplicate sends when the RAF loop's setNodes triggers a re-render
   // that re-fires this effect with identical producer values.
   const lastSentRef = useRef<Map<string, unknown>>(new Map());
+
+  // Debounce prompt sends from primitive nodes so intermediate keystrokes
+  // don't spam the pipeline.  Key = "backendId\0prompts", value = timeout handle.
+  const PROMPT_DEBOUNCE_MS = 1000;
+  const promptDebounceRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
+
+  // Clean up any pending debounce timers on unmount.
+  useEffect(() => {
+    const ref = promptDebounceRef.current;
+    return () => {
+      ref.forEach(t => clearTimeout(t));
+      ref.clear();
+    };
+  }, []);
 
   // Detect streaming session start (false→true) and clear dedup state so the
   // new backend session receives all parameter values, even if they haven't
@@ -215,7 +235,17 @@ export function useValueForwarding(
       }> = [];
 
       if (node.data.nodeType === "primitive") {
-        valuesToForward.push({ handleName: null, value: node.data.value });
+        if (node.data.primitiveAutoSend === false) {
+          // Manual send mode: only forward the committed value, skip if none yet
+          if (node.data.committedValue !== undefined) {
+            valuesToForward.push({
+              handleName: null,
+              value: node.data.committedValue,
+            });
+          }
+        } else {
+          valuesToForward.push({ handleName: null, value: node.data.value });
+        }
       } else if (node.data.nodeType === "reroute") {
         valuesToForward.push({ handleName: null, value: node.data.value });
       } else if (
@@ -252,6 +282,11 @@ export function useValueForwarding(
         valuesToForward.push({
           handleName: mediaHandleName,
           value: node.data.imagePath || "",
+        });
+      } else if (node.data.nodeType === "audio") {
+        valuesToForward.push({
+          handleName: "value",
+          value: node.data.audioPath || "",
         });
       } else if (node.data.nodeType === "midi") {
         const midiChannels = node.data.midiChannels;
@@ -399,20 +434,56 @@ export function useValueForwarding(
         if (!entry || entry.value === undefined) continue;
 
         if (resolvedParamName === "__prompt") {
-          if (Array.isArray(entry.value)) {
-            sendParam(resolvedBackendId, "prompts", entry.value);
-            const srcNode = nodes.find(n => n.id === edge.source);
-            if (srcNode?.data.nodeType === "prompt_blend") {
-              sendParam(
-                resolvedBackendId,
-                "prompt_interpolation_method",
-                srcNode.data.promptBlendMethod ?? "linear"
-              );
+          // Keep nodeParams.__prompt in sync immediately so
+          // getGraphNodePrompts and stream-start initialisation use the
+          // connected value, not the stale default.
+          const promptText = Array.isArray(entry.value)
+            ? (entry.value[0]?.text ?? "")
+            : String(entry.value);
+          onPromptForwardRef?.current?.(edge.target, promptText);
+
+          const capturedValue = entry.value;
+          const capturedBackendId = resolvedBackendId;
+          const capturedSource = nodes.find(n => n.id === edge.source);
+
+          const sendPrompt = () => {
+            if (Array.isArray(capturedValue)) {
+              sendParam(capturedBackendId, "prompts", capturedValue);
+              if (capturedSource?.data.nodeType === "prompt_blend") {
+                sendParam(
+                  capturedBackendId,
+                  "prompt_interpolation_method",
+                  capturedSource.data.promptBlendMethod ?? "linear"
+                );
+              }
+            } else {
+              sendParam(capturedBackendId, "prompts", [
+                { text: String(capturedValue), weight: 100 },
+              ]);
             }
+          };
+
+          // Only debounce prompts coming from auto-send primitives so
+          // intermediate keystrokes don't spam the pipeline.  Manual
+          // sends (committedValue) and non-primitive sources fire
+          // immediately.
+          const isPrimitiveAutoSend =
+            node.data.nodeType === "primitive" &&
+            node.data.primitiveAutoSend !== false;
+
+          if (isPrimitiveAutoSend) {
+            const debounceKey = `${resolvedBackendId}\0prompts`;
+            const existingTimer = promptDebounceRef.current.get(debounceKey);
+            if (existingTimer) clearTimeout(existingTimer);
+            promptDebounceRef.current.set(
+              debounceKey,
+              setTimeout(() => {
+                promptDebounceRef.current.delete(debounceKey);
+                sendPrompt();
+              }, PROMPT_DEBOUNCE_MS)
+            );
           } else {
-            sendParam(resolvedBackendId, "prompts", [
-              { text: String(entry.value), weight: 100 },
-            ]);
+            sendPrompt();
           }
         } else {
           sendParam(resolvedBackendId, resolvedParamName, entry.value);
@@ -491,6 +562,11 @@ export function useValueForwarding(
           targetParsed.name === "value"
         ) {
           nodeUpdates["value"] = sourceValue;
+          // When value comes from upstream, always treat it as committed
+          // so it propagates downstream regardless of autoSend setting
+          if (targetNode.data.primitiveAutoSend === false) {
+            nodeUpdates["committedValue"] = sourceValue;
+          }
         } else if (
           targetNode.data.nodeType === "slider" &&
           targetParsed.name === "value"

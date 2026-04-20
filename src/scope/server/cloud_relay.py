@@ -7,10 +7,13 @@ cloud-specific state across its own fields.
 
 import logging
 import queue
+from fractions import Fraction
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+
+from .media_packets import AudioPacket, MediaTimestamp, VideoPacket
 
 if TYPE_CHECKING:
     from aiortc.mediastreams import VideoFrame
@@ -19,6 +22,25 @@ if TYPE_CHECKING:
     from .cloud_connection import CloudConnectionManager
 
 logger = logging.getLogger(__name__)
+
+
+def compute_relay_video_mode(initial_parameters: dict | None) -> bool:
+    """Return whether ``CloudRelay`` should forward frames to the cloud runner.
+
+    ``input_mode == "video"`` is the primary signal for classic (non-graph)
+    sessions. Graph workflows with at least one Source node always have video
+    input to relay. Without this, :class:`CloudRelay` drops every frame when
+    ``video_mode`` is false (e.g. Syphon works locally but not in cloud).
+    """
+    params = initial_parameters or {}
+    if params.get("input_mode") == "video":
+        return True
+    graph_data = params.get("graph")
+    if graph_data and isinstance(graph_data, dict):
+        for node in graph_data.get("nodes", []):
+            if node.get("type") == "source":
+                return True
+    return False
 
 
 class CloudRelay:
@@ -41,7 +63,7 @@ class CloudRelay:
 
         # Output queues populated by cloud callbacks
         self._frame_queue: queue.Queue = queue.Queue(maxsize=2)
-        self._audio_queue: queue.Queue = queue.Queue(maxsize=50)
+        self._audio_queue: queue.Queue[AudioPacket] = queue.Queue(maxsize=50)
 
         # Counters
         self.frames_to_cloud = 0
@@ -66,15 +88,27 @@ class CloudRelay:
     def send_frame(self, rgb_frame: np.ndarray) -> bool:
         """Send a frame to the cloud (generic / track 0)."""
         if not self._video_mode:
+            if self.frames_to_cloud == 0:
+                logger.warning(
+                    "[CLOUD-RELAY] Dropping frame: video_mode=False "
+                    "(Syphon/graph source detected but relay not enabled)"
+                )
             return False
         sent = self._cloud_manager.send_frame(rgb_frame)
         if sent:
             self.frames_to_cloud += 1
+            if self.frames_to_cloud == 1:
+                logger.info("[CLOUD-RELAY] First frame sent to cloud (generic/track 0)")
         return sent
 
     def send_frame_to_source(self, rgb_frame: np.ndarray, source_node_id: str) -> bool:
         """Send a frame to a specific cloud source track."""
         if not self._video_mode:
+            if self.frames_to_cloud == 0:
+                logger.warning(
+                    "[CLOUD-RELAY] Dropping frame for source %s: video_mode=False",
+                    source_node_id,
+                )
             return False
         # Try multi-track API if available, otherwise fall back to generic send
         get_idx = getattr(self._cloud_manager, "get_source_track_index", None)
@@ -85,6 +119,13 @@ class CloudRelay:
             sent = self._cloud_manager.send_frame(rgb_frame)
         if sent:
             self.frames_to_cloud += 1
+            if self.frames_to_cloud == 1:
+                logger.info(
+                    "[CLOUD-RELAY] First frame sent to cloud for source %s "
+                    "(track_idx=%s)",
+                    source_node_id,
+                    track_idx,
+                )
         return sent
 
     # ------------------------------------------------------------------
@@ -94,14 +135,36 @@ class CloudRelay:
     def on_frame_from_cloud(self, frame: "VideoFrame") -> None:
         """Callback when a processed video frame is received from cloud."""
         self.frames_from_cloud += 1
+        if self.frames_from_cloud == 1:
+            logger.info("[CLOUD-RELAY] First frame received from cloud")
         try:
             frame_np = frame.to_ndarray(format="rgb24")
             try:
-                self._frame_queue.put_nowait(frame_np)
+                self._frame_queue.put_nowait(
+                    VideoPacket(
+                        tensor=torch.from_numpy(frame_np),
+                        timestamp=MediaTimestamp(
+                            pts=frame.pts,
+                            time_base=Fraction(frame.time_base)
+                            if frame.time_base is not None
+                            else None,
+                        ),
+                    )
+                )
             except queue.Full:
                 try:
                     self._frame_queue.get_nowait()
-                    self._frame_queue.put_nowait(frame_np)
+                    self._frame_queue.put_nowait(
+                        VideoPacket(
+                            tensor=torch.from_numpy(frame_np),
+                            timestamp=MediaTimestamp(
+                                pts=frame.pts,
+                                time_base=Fraction(frame.time_base)
+                                if frame.time_base is not None
+                                else None,
+                            ),
+                        )
+                    )
                 except queue.Empty:
                     pass
         except Exception as e:
@@ -134,12 +197,22 @@ class CloudRelay:
             if frame.format.name in ("s16", "s16p"):
                 audio_tensor = audio_tensor / 32768.0
 
+            packet = AudioPacket(
+                audio=audio_tensor,
+                sample_rate=frame.sample_rate,
+                timestamp=MediaTimestamp(
+                    pts=frame.pts,
+                    time_base=Fraction(frame.time_base)
+                    if frame.time_base is not None
+                    else None,
+                ),
+            )
             try:
-                self._audio_queue.put_nowait((audio_tensor, frame.sample_rate))
+                self._audio_queue.put_nowait(packet)
             except queue.Full:
                 try:
                     self._audio_queue.get_nowait()
-                    self._audio_queue.put_nowait((audio_tensor, frame.sample_rate))
+                    self._audio_queue.put_nowait(packet)
                 except queue.Empty:
                     pass
         except Exception as e:
@@ -149,20 +222,19 @@ class CloudRelay:
     # Consuming received output
     # ------------------------------------------------------------------
 
-    def get_frame(self) -> torch.Tensor | None:
+    def get_frame(self) -> VideoPacket | None:
         """Get the next video frame received from cloud, or None."""
         try:
-            frame_np = self._frame_queue.get_nowait()
-            return torch.from_numpy(frame_np)
+            return self._frame_queue.get_nowait()
         except queue.Empty:
             return None
 
-    def get_audio(self) -> tuple[torch.Tensor | None, int | None]:
-        """Get the next audio chunk and sample rate, or (None, None)."""
+    def get_audio(self) -> AudioPacket | None:
+        """Get the next audio packet received from cloud, or None."""
         try:
             return self._audio_queue.get_nowait()
         except queue.Empty:
-            return None, None
+            return None
 
     # ------------------------------------------------------------------
     # Lifecycle

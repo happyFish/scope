@@ -8,8 +8,10 @@ import {
   COLOR_STRING,
   COLOR_STREAM,
   COLOR_VACE,
+  COLOR_AUDIO,
   COLOR_BOOLEAN,
   COLOR_TRIGGER,
+  COLOR_LORA,
   COLOR_DEFAULT,
 } from "./nodeColors";
 
@@ -60,8 +62,14 @@ export function getEdgeColor(
         ? COLOR_STREAM
         : COLOR_STRING;
     }
+    if (sourceNode.data.nodeType === "audio") {
+      return COLOR_AUDIO;
+    }
     if (sourceNode.data.nodeType === "vace") {
       return COLOR_VACE;
+    }
+    if (sourceNode.data.nodeType === "lora") {
+      return COLOR_LORA;
     }
     if (sourceNode.data.nodeType === "midi") {
       return COLOR_NUMBER;
