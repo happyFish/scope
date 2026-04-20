@@ -262,6 +262,11 @@ class VideoProcessingTrack(MediaStreamTrack):
                 logger.info(
                     f"Input source mode enabled: {input_source.get('source_type')}"
                 )
+            elif initial_parameters.get("input_mode") == "text":
+                # Text mode: pipeline generates output without any video input,
+                # so keep the recv() output loop alive without a WebRTC track.
+                self._input_source_enabled = True
+                logger.info("Text mode: output loop enabled without video input")
 
     async def input_loop(self):
         """Background loop that continuously feeds frames to the processor."""

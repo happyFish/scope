@@ -395,14 +395,17 @@ def _resize_graph_queues(
         if requirements is None:
             continue
 
-        target_size = max(
-            DEFAULT_INPUT_QUEUE_MAXSIZE,
-            requirements.input_size * OUTPUT_QUEUE_MAX_SIZE_FACTOR,
-        )
+        if requirements.max_input_queue_size is not None:
+            target_size = requirements.max_input_queue_size
+        else:
+            target_size = max(
+                DEFAULT_INPUT_QUEUE_MAXSIZE,
+                requirements.input_size * OUTPUT_QUEUE_MAX_SIZE_FACTOR,
+            )
 
         with proc.input_queue_lock:
             for port, old_q in list(proc.input_queues.items()):
-                if old_q.maxsize >= target_size:
+                if old_q.maxsize == target_size:
                     continue
                 new_q = queue.Queue(maxsize=target_size)
                 proc.input_queues[port] = new_q
