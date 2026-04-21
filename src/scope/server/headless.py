@@ -48,6 +48,7 @@ class HeadlessSession:
         self._notification_subscribers: list[Callable[[dict], None]] = []
         self._notification_subscribers_lock = threading.Lock()
         frame_processor.notification_callback = self._dispatch_notification
+        frame_processor.wire_processor_notifications()
         # ParameterScheduler captures its own callback reference at
         # construction time, so update it too if present (used for tempo /
         # quantized-update notifications).

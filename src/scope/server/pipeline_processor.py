@@ -70,6 +70,11 @@ class PipelineProcessor:
         self.tempo_sync = tempo_sync
         self.modulation_engine = modulation_engine
 
+        # Optional callback for broadcasting non-tensor state to clients.
+        # Set by FrameProcessor after graph setup for pipelines with
+        # broadcast_state_updates = True in their config.
+        self.notification_callback: Any | None = None
+
         # Port-based queues wired by graph_executor.build_graph()
         self.input_queues: dict[str, queue.Queue] = {}
         self.output_queues: dict[str, list[queue.Queue]] = {}
@@ -514,6 +519,19 @@ class PipelineProcessor:
                             if proc_id not in seen:
                                 seen.add(proc_id)
                                 consumer_proc.update_parameters(extra_params)
+
+                # Broadcast non-tensor state to connected clients if enabled.
+                if extra_params and self.notification_callback:
+                    broadcast = {
+                        k: v for k, v in extra_params.items()
+                        if not isinstance(v, torch.Tensor)
+                    }
+                    if broadcast:
+                        self.notification_callback({
+                            "type": "pipeline_state",
+                            "pipeline_id": self.pipeline_id,
+                            "state": broadcast,
+                        })
 
             except Exception as e:
                 if self._is_recoverable(e):

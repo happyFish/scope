@@ -264,6 +264,10 @@ class BasePipelineConfig(BaseModel):
     inputs: ClassVar[list[str]] = ["video"]
     outputs: ClassVar[list[str]] = ["video"]
 
+    # When True, non-tensor return values from __call__ are broadcast to
+    # connected WebRTC clients as a 'pipeline_state' notification.
+    broadcast_state_updates: ClassVar[bool] = False
+
     # Mode configuration - keys are mode names, values are ModeDefaults with field overrides
     # Use default=True to mark the default mode. Only include fields that differ from base.
     modes: ClassVar[dict[str, ModeDefaults]] = {"text": ModeDefaults(default=True)}

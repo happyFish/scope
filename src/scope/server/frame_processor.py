@@ -136,6 +136,20 @@ class FrameProcessor:
         if pipeline_ids is not None:
             self.pipeline_ids = pipeline_ids
 
+    def wire_processor_notifications(self) -> None:
+        """Wire notification_callback to pipeline processors that opt in.
+
+        Called after notification_callback is set (e.g. by HeadlessSession)
+        so processors whose config has broadcast_state_updates=True can
+        broadcast non-tensor return values to connected clients.
+        """
+        if not self.notification_callback:
+            return
+        for proc in self.pipeline_processors:
+            config_cls = proc.pipeline.get_config_class()
+            if getattr(config_cls, 'broadcast_state_updates', False):
+                proc.notification_callback = self.notification_callback
+
     def start(self):
         if self.running:
             return
