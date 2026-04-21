@@ -97,6 +97,13 @@ class VideoDepthAnything(nn.Module):
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
         self.metric = metric
 
+        # Cached normalization constants for GPU-native preprocessing
+        self._norm_mean: torch.Tensor | None = None
+        self._norm_std: torch.Tensor | None = None
+        # Cache transform target size keyed on (input_size, frame_height, frame_width)
+        self._cached_target_size: tuple[int, int, int, int, int] | None = None
+        self._cached_target_hw: tuple[int, int] | None = None
+
     def forward(self, x, cached_hidden_state_list=None):
         B, T, C, H, W = x.shape
         patch_h, patch_w = H // 14, W // 14
@@ -106,6 +113,143 @@ class VideoDepthAnything(nn.Module):
         depth = F.relu(depth)
         return depth.squeeze(1).unflatten(0, (B, T)), hidden_states # return shape [B, T, H, W] and hidden states
 
+
+    def _get_norm_tensors(self, device: torch.device, dtype: torch.dtype):
+        """Return cached normalization mean/std tensors on the right device/dtype."""
+        if (
+            self._norm_mean is None
+            or self._norm_mean.device != device
+            or self._norm_mean.dtype != dtype
+        ):
+            self._norm_mean = torch.tensor(
+                [0.485, 0.456, 0.406], device=device, dtype=dtype
+            ).view(1, 3, 1, 1)
+            self._norm_std = torch.tensor(
+                [0.229, 0.224, 0.225], device=device, dtype=dtype
+            ).view(1, 3, 1, 1)
+        return self._norm_mean, self._norm_std
+
+    def _compute_target_size(self, input_size: int, frame_height: int, frame_width: int) -> tuple[int, int]:
+        """Compute the target resize dimensions, cached across calls with same params."""
+        cache_key = (input_size, frame_height, frame_width)
+        if self._cached_target_size is not None and (
+            self._cached_target_size[0] == cache_key[0]
+            and self._cached_target_size[1] == cache_key[1]
+            and self._cached_target_size[2] == cache_key[2]
+        ):
+            return self._cached_target_hw
+
+        # Replicate the Resize transform logic for lower_bound + keep_aspect_ratio
+        scale_height = input_size / frame_height
+        scale_width = input_size / frame_width
+        # lower_bound: scale by the larger factor
+        if scale_width > scale_height:
+            scale_height = scale_width
+        else:
+            scale_width = scale_height
+
+        new_height = int(np.round(scale_height * frame_height / 14) * 14)
+        new_width = int(np.round(scale_width * frame_width / 14) * 14)
+        # Ensure at least input_size
+        if new_height < input_size:
+            new_height = int(np.ceil(scale_height * frame_height / 14) * 14)
+        if new_width < input_size:
+            new_width = int(np.ceil(scale_width * frame_width / 14) * 14)
+
+        self._cached_target_size = cache_key
+        self._cached_target_hw = (new_height, new_width)
+        return self._cached_target_hw
+
+    def _preprocess_tensor(
+        self,
+        frame_tensor: torch.Tensor,
+        input_size: int,
+    ) -> torch.Tensor:
+        """GPU-native preprocessing: resize + normalize a [1, 3, H, W] float32 tensor in [0, 1].
+
+        Equivalent to the Compose([Resize, NormalizeImage, PrepareForNet]) pipeline
+        but stays entirely on GPU, avoiding CPU/numpy roundtrips.
+
+        Args:
+            frame_tensor: (1, 3, H, W) float tensor in [0, 1] on the target device.
+            input_size: Base input size (will be adjusted for aspect ratio).
+
+        Returns:
+            (1, 1, 3, H', W') tensor ready for self.forward().
+        """
+        _, _, frame_height, frame_width = frame_tensor.shape
+        target_h, target_w = self._compute_target_size(input_size, frame_height, frame_width)
+
+        # Resize on GPU
+        resized = F.interpolate(
+            frame_tensor,
+            size=(target_h, target_w),
+            mode="bicubic",
+            align_corners=False,
+        )
+
+        # Normalize (ImageNet stats)
+        mean, std = self._get_norm_tensors(frame_tensor.device, frame_tensor.dtype)
+        normalized = (resized - mean) / std
+
+        # Add temporal dimension: (1, 3, H', W') -> (1, 1, 3, H', W')
+        return normalized.unsqueeze(1)
+
+    def infer_depth_tensor(
+        self,
+        frame_tensor: torch.Tensor,
+        input_size: int = 518,
+        fp32: bool = False,
+        cached_hidden_state_list=None,
+    ) -> tuple[torch.Tensor, list]:
+        """Process a single frame entirely on GPU, returning a GPU tensor.
+
+        This is the GPU-native alternative to infer_video_depth_one(). It avoids
+        all CPU/numpy roundtrips by accepting and returning GPU tensors directly.
+
+        Args:
+            frame_tensor: (1, 3, H, W) float tensor in [0, 1] on the model's device.
+                          Must already be on the correct device and dtype.
+            input_size: Input size for model inference (default 518, divisible by 14).
+            fp32: If True disable autocast (use full fp32 precision).
+            cached_hidden_state_list: Cached hidden states from previous frames
+                for temporal consistency.
+
+        Returns:
+            depth: (H, W) float32 tensor on the same device as input, un-normalized
+                   raw depth values (higher = further).
+            hidden_states: Updated hidden states for next frame.
+        """
+        _, _, frame_height, frame_width = frame_tensor.shape
+
+        ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
+        if ratio > 1.78:
+            input_size = int(input_size * 1.777 / ratio)
+            input_size = round(input_size / 14) * 14
+
+        # GPU-native preprocessing
+        model_input = self._preprocess_tensor(frame_tensor, input_size)
+
+        device_str = "cuda" if frame_tensor.device.type == "cuda" else "cpu"
+
+        with torch.no_grad():
+            with torch.autocast(device_type=device_str, enabled=(not fp32)):
+                depth, hidden_states = self.forward(
+                    model_input, cached_hidden_state_list=cached_hidden_state_list
+                )
+                depth = depth.to(model_input.dtype)
+
+                # Resize back to original frame size — stays on GPU
+                depth = F.interpolate(
+                    depth.flatten(0, 1).unsqueeze(1),
+                    size=(frame_height, frame_width),
+                    mode="bilinear",
+                    align_corners=True,
+                )
+                # (1, 1, H, W) -> (H, W)
+                depth = depth[0, 0]
+
+        return depth, hidden_states
 
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
         frame_height, frame_width = frames[0].shape[:2]
@@ -208,20 +352,49 @@ class VideoDepthAnything(nn.Module):
 
         return np.stack(depth_list[:org_video_len], axis=0), target_fps
 
-    def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False, cached_hidden_state_list=None):
+    def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False, cached_hidden_state_list=None, return_tensor=False):
         """Process a single frame in streaming mode.
 
         Args:
-            frame: Single frame as numpy array in RGB format [H, W, 3], uint8 [0, 255]
+            frame: Single frame as numpy array in RGB format [H, W, 3], uint8 [0, 255].
+                   Also accepts a GPU tensor (H, W, 3) in [0, 1] float when return_tensor=True.
             input_size: Input size for model inference
             device: Device to run inference on
             fp32: Use fp32 precision
             cached_hidden_state_list: Cached hidden states from previous frames for temporal consistency
+            return_tensor: If True, return depth as a GPU tensor (H, W) instead of
+                numpy array.  When the input ``frame`` is already a torch.Tensor on
+                the target device the entire pipeline stays on GPU with zero CPU
+                roundtrips.
 
         Returns:
-            depth: Depth map as numpy array [H, W]
+            depth: Depth map as numpy array [H, W] (default) or GPU tensor [H, W]
+                (when return_tensor=True)
             cached_hidden_state_list: Updated hidden states for next frame
         """
+        # Fast path: if the caller already has a GPU tensor, delegate to
+        # infer_depth_tensor to avoid all CPU/numpy overhead.
+        if return_tensor and isinstance(frame, torch.Tensor):
+            # Accept (H, W, C) and convert to (1, C, H, W)
+            if frame.ndim == 3:
+                t = frame.permute(2, 0, 1).unsqueeze(0)
+            else:
+                t = frame
+            # Ensure float [0, 1]
+            if t.dtype == torch.uint8:
+                t = t.float() / 255.0
+            t = t.to(device=device, dtype=torch.float32)
+            return self.infer_depth_tensor(
+                t,
+                input_size=input_size,
+                fp32=fp32,
+                cached_hidden_state_list=cached_hidden_state_list,
+            )
+
+        # Legacy numpy path — kept for backward compatibility
+        if isinstance(frame, torch.Tensor):
+            frame = frame.cpu().numpy()
+
         frame_height, frame_width = frame.shape[:2]
         ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
         if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
@@ -268,6 +441,10 @@ class VideoDepthAnything(nn.Module):
                     mode='bilinear',
                     align_corners=True
                 )
-                depth = depth[0, 0].cpu().numpy()  # [H, W]
+
+                if return_tensor:
+                    depth = depth[0, 0]  # (H, W) tensor, stays on GPU
+                else:
+                    depth = depth[0, 0].cpu().numpy()  # [H, W]
 
         return depth, hidden_states

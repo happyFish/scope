@@ -80,6 +80,10 @@ class VideoDepthAnythingPipeline(Pipeline):
     def __call__(self, **kwargs) -> dict:
         """Process video frames and return depth maps.
 
+        Uses the GPU-native path (infer_depth_tensor) to avoid CPU/numpy
+        roundtrips.  Input tensors that are already on the target device stay
+        on GPU throughout the entire pipeline.
+
         Args:
             video: Input video frames as list of tensors (THWC format, [0, 255] range)
                    or tensor in BCTHW format
@@ -97,55 +101,43 @@ class VideoDepthAnythingPipeline(Pipeline):
         # Normalize frame sizes to handle resolution changes
         video = normalize_frame_sizes(video)
 
-        # Convert input to numpy uint8 array
-        # Frames from frame_processor are always (1, H, W, C), so we squeeze the T dimension
-        frames = []
-        for frame in video:
-            frame_np = (
-                frame.cpu().numpy()
-                if isinstance(frame, torch.Tensor)
-                else np.array(frame)
-            )
-            # Squeeze T dimension: (1, H, W, C) -> (H, W, C)
-            frame_np = frame_np.squeeze(0)
-            frames.append(frame_np)
-        frames = np.stack(frames, axis=0)
-
-        # Ensure uint8 format [0, 255]
-        # Note: Frames should be in RGB format [H, W, 3]
-        if frames.dtype != np.uint8:
-            frames = (
-                (frames * 255).astype(np.uint8)
-                if frames.max() <= 1.0
-                else frames.astype(np.uint8)
-            )
-
-        num_frames = frames.shape[0]
-
-        # Process frames one at a time using streaming mode
+        num_frames = len(video)
         depths = []
         cached_hidden_state_list = None
-        device_str = "cuda" if self.device.type == "cuda" else "cpu"
 
         with torch.no_grad():
             for i in range(num_frames):
-                frame = frames[i]  # [H, W, 3] in RGB format
+                frame = video[i]  # (1, H, W, C) or (H, W, C) tensor
 
-                # Process single frame in streaming mode
-                depth, cached_hidden_state_list = self.model.infer_video_depth_one(
-                    frame,
+                if not isinstance(frame, torch.Tensor):
+                    frame = torch.from_numpy(np.array(frame))
+
+                # Squeeze T dimension: (1, H, W, C) -> (H, W, C)
+                frame = frame.squeeze(0)
+
+                # Ensure float [0, 1]
+                if frame.dtype == torch.uint8:
+                    frame = frame.float() / 255.0
+                elif frame.max() > 1.0:
+                    frame = frame.float() / 255.0
+
+                # (H, W, C) -> (1, C, H, W) for GPU-native path
+                frame_bchw = frame.to(
+                    device=self.device, dtype=torch.float32
+                ).permute(2, 0, 1).unsqueeze(0)
+
+                depth, cached_hidden_state_list = self.model.infer_depth_tensor(
+                    frame_bchw,
                     input_size=self.input_size,
-                    device=device_str,
                     fp32=self.fp32,
                     cached_hidden_state_list=cached_hidden_state_list,
                 )
                 depths.append(depth)
 
-        # Stack depths: [T, H, W]
-        depths = np.stack(depths, axis=0)
+        # Stack depths on GPU: [T, H, W]
+        depths = torch.stack(depths, dim=0)
 
-        # Normalize depths to [0, 1] and convert to THWC format
-        depths = torch.from_numpy(depths).float()
+        # Normalize depths to [0, 1]
         d_min, d_max = depths.min(), depths.max()
         depths = (
             (depths - d_min) / (d_max - d_min)
