@@ -1863,8 +1863,11 @@ async def upload_asset(
         assets_dir = get_assets_dir()
         assets_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save file to assets directory
-        file_path = assets_dir / filename
+        # Save file to assets directory (supports nested paths like "folder/file.mp4")
+        file_path = (assets_dir / filename).resolve()
+        if not file_path.is_relative_to(assets_dir.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid filename path")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(content)
 
         # Return file info matching AssetFileInfo structure
